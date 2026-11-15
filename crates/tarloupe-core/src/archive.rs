@@ -3,14 +3,16 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::codec::Codec;
 use crate::entry::{Entry, EntryKind};
 use crate::error::{Error, Result};
+use crate::gzip::{self, GzRandom, IndexingReader};
 use crate::index::{build_tree, default_index_dir, Index};
 use crate::key::ArchiveKey;
 use crate::path::{normalize, resolve_link};
-use crate::walker::{SeekSource, Walker};
+use crate::walker::{ReadSource, SeekSource, Walker};
 
 /// Maximum symlink/hard-link hops when resolving an entry to its data.
 const MAX_LINK_HOPS: usize = 40;
@@ -25,6 +27,10 @@ pub struct OpenOptions {
     pub rebuild: bool,
     /// Fail instead of building when no valid index exists.
     pub require_index: bool,
+    /// Distance between gzip checkpoints when building an index, in
+    /// uncompressed bytes (default 8 MiB). Smaller is faster for random
+    /// reads and makes the index larger.
+    pub checkpoint_spacing: Option<u64>,
 }
 
 /// What [`Archive::open`] did about the index.
@@ -37,10 +43,11 @@ pub enum IndexStatus {
 
 pub struct Archive {
     path: PathBuf,
-    file: File,
+    file: Arc<File>,
     codec: Codec,
     index: Index,
     status: IndexStatus,
+    gzip: Option<GzRandom>,
 }
 
 impl Archive {
@@ -49,7 +56,7 @@ impl Archive {
         let path = path.as_ref().to_path_buf();
         let mut file = File::open(&path)?;
         let codec = detect(&mut file)?;
-        if codec != Codec::None {
+        if !matches!(codec, Codec::None | Codec::Gzip) {
             return Err(Error::UnsupportedCodec {
                 codec: codec.name(),
                 milestone: codec.milestone(),
@@ -58,6 +65,11 @@ impl Archive {
         // Key and index come from the handle we keep for reads, so they
         // describe the same file even if the path is replaced meanwhile.
         let key = ArchiveKey::from_file(&file)?;
+        let file = Arc::new(file);
+        let spacing = opts
+            .checkpoint_spacing
+            .unwrap_or(gzip::DEFAULT_SPACING)
+            .max(64 * 1024);
         let index_path = match &opts.index_path {
             Some(p) => p.clone(),
             None => opts
@@ -81,7 +93,7 @@ impl Archive {
                     return Err(e)
                 }
                 Err(Error::StaleIndex { .. }) | Err(Error::Sqlite(_)) => (
-                    build_index(&file, &index_path, &key, codec)?,
+                    build_index(&file, &index_path, &key, codec, spacing)?,
                     IndexStatus::Rebuilt,
                 ),
                 Err(e) => return Err(e),
@@ -94,15 +106,20 @@ impl Archive {
             } else {
                 IndexStatus::Built
             };
-            (build_index(&file, &index_path, &key, codec)?, st)
+            (build_index(&file, &index_path, &key, codec, spacing)?, st)
         };
 
+        let gzip = match codec {
+            Codec::Gzip => Some(GzRandom::new(file.clone(), index.checkpoints()?)),
+            _ => None,
+        };
         Ok(Archive {
             path,
             file,
             codec,
             index,
             status,
+            gzip,
         })
     }
 
@@ -218,7 +235,7 @@ impl Archive {
         match &e.sparse {
             None => {
                 let avail = e.stored_size.saturating_sub(offset).min(want as u64) as usize;
-                pread_exact(&self.file, &mut buf[..avail], e.data_offset + offset)?;
+                self.read_stream(&mut buf[..avail], e.data_offset + offset)?;
                 buf[avail..].fill(0);
             }
             Some(chunks) => {
@@ -231,8 +248,7 @@ impl Archive {
                         let s = cs.max(offset);
                         let t = ce.min(end);
                         let src = e.data_offset + stored + (s - cs);
-                        pread_exact(
-                            &self.file,
+                        self.read_stream(
                             &mut buf[(s - offset) as usize..(t - offset) as usize],
                             src,
                         )?;
@@ -242,6 +258,27 @@ impl Archive {
             }
         }
         Ok(want)
+    }
+
+    /// Reads `buf.len()` bytes of the (uncompressed) tar stream at `off`.
+    fn read_stream(&self, buf: &mut [u8], off: u64) -> Result<()> {
+        match &self.gzip {
+            None => pread_exact(&self.file, buf, off),
+            Some(gz) => {
+                let window = |at: u64| {
+                    self.index
+                        .checkpoint_window(at)
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                };
+                gz.read_exact_at(buf, off, &window).map_err(|e| {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        Error::corrupt(off, "the archive ends before this member's data")
+                    } else {
+                        e.into()
+                    }
+                })
+            }
+        }
     }
 
     /// Streams an entry's full contents (following links) into `w`.
@@ -316,11 +353,29 @@ fn same_file(a: &Path, b: &Path) -> bool {
     matches!((canon(a), canon(b)), (Some(x), Some(y)) if x == y)
 }
 
-fn build_index(file: &File, index_path: &Path, key: &ArchiveKey, codec: Codec) -> Result<Index> {
-    let mut reader = file.try_clone()?;
-    reader.seek(SeekFrom::Start(0))?;
-    let src = SeekSource::new(std::io::BufReader::with_capacity(64 * 1024, reader))?;
-    let members = Walker::new(src).collect::<Result<Vec<_>>>()?;
+fn build_index(
+    file: &Arc<File>,
+    index_path: &Path,
+    key: &ArchiveKey,
+    codec: Codec,
+    spacing: u64,
+) -> Result<Index> {
+    let (members, checkpoints) = match codec {
+        Codec::Gzip => {
+            let mut reader = IndexingReader::new(file.clone(), spacing)?;
+            let members = Walker::new(ReadSource::new(&mut reader)).collect::<Result<Vec<_>>>()?;
+            // The walker stops at the tar terminator; decode the rest so a
+            // damaged tail or a bad trailer CRC fails here, not later.
+            std::io::copy(&mut reader, &mut std::io::sink())?;
+            (members, std::mem::take(&mut reader.checkpoints))
+        }
+        _ => {
+            let mut reader = file.try_clone()?;
+            reader.seek(SeekFrom::Start(0))?;
+            let src = SeekSource::new(std::io::BufReader::with_capacity(64 * 1024, reader))?;
+            (Walker::new(src).collect::<Result<Vec<_>>>()?, Vec::new())
+        }
+    };
     // Refuse to publish an index if the file changed while it was read.
     if ArchiveKey::from_file(file)? != *key {
         return Err(Error::Unsupported(
@@ -328,18 +383,18 @@ fn build_index(file: &File, index_path: &Path, key: &ArchiveKey, codec: Codec) -
         ));
     }
     let entries = build_tree(members);
-    Index::create(index_path, key, codec, &entries)
+    Index::create(index_path, key, codec, &entries, &checkpoints)
 }
 
 #[cfg(unix)]
-fn pread_exact(f: &File, buf: &mut [u8], off: u64) -> Result<()> {
+pub(crate) fn pread_exact(f: &File, buf: &mut [u8], off: u64) -> Result<()> {
     use std::os::unix::fs::FileExt;
     f.read_exact_at(buf, off)?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn pread_exact(f: &File, mut buf: &mut [u8], mut off: u64) -> Result<()> {
+pub(crate) fn pread_exact(f: &File, mut buf: &mut [u8], mut off: u64) -> Result<()> {
     use std::os::windows::fs::FileExt;
     while !buf.is_empty() {
         match f.seek_read(buf, off)? {
