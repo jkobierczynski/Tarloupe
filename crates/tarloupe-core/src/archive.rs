@@ -432,6 +432,9 @@ fn build_index(
     }
     let (members, checkpoints) = walked?;
     report.done();
+    if report.cancelled() {
+        return Err(Error::Cancelled); // cancelled just as it finished
+    }
     // Refuse to publish an index if the file changed while it was read.
     if ArchiveKey::from_file(file)? != *key {
         return Err(Error::Unsupported(

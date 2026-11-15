@@ -344,10 +344,14 @@ fn cancelling_stops_indexing_and_leaves_no_index() {
     let gz = dir.path().join("c.tar.gz");
     fs::write(&plain, &tar).unwrap();
     fs::write(&gz, gzip(&tar, 6, None).unwrap()).unwrap();
-    for path in [&plain, &gz] {
-        let idx = dir
-            .path()
-            .join(format!("idx-{}", path.display().to_string().len()));
+    // A small one reports no progress before the end, where it is cancelled.
+    let small = dir.path().join("small.tar");
+    let mut w = tarloupe_corpus::TarWriter::new(File::create(&small).unwrap(), Format::Gnu);
+    let m = tarloupe_corpus::Member::new("a", tarloupe_corpus::Kind::File, 1, 0);
+    w.append(&m, &mut &b"x"[..]).unwrap();
+    w.finish().unwrap();
+    for (i, path) in [&plain, &gz, &small].into_iter().enumerate() {
+        let idx = dir.path().join(format!("idx-{i}"));
         let cancel = Arc::new(AtomicBool::new(false));
         let c = cancel.clone();
         let opts = OpenOptions {
