@@ -441,6 +441,11 @@ impl IndexingReader {
         })
     }
 
+    /// Bytes of the gzip file read so far.
+    pub fn compressed_position(&self) -> u64 {
+        self.dec.next_read
+    }
+
     fn window(&self) -> Vec<u8> {
         if self.wrapped {
             let mut w = self.win[self.wpos..].to_vec();

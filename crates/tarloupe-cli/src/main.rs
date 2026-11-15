@@ -139,6 +139,7 @@ fn open(archive: &PathBuf, idx: &IndexOpts, rebuild: bool) -> Result<Archive> {
         rebuild,
         require_index: false,
         checkpoint_spacing: idx.checkpoint_spacing,
+        progress: None,
     };
     let start = Instant::now();
     let a = Archive::open(archive, &opts)
@@ -373,7 +374,10 @@ fn browse(archive: &std::path::Path, idle: u64, no_window: bool) -> Result<()> {
     let opts = browse::Options {
         idle: std::time::Duration::from_secs(idle),
         open_window: !no_window,
+        ..Default::default()
     };
+    let stop = opts.stop.clone();
+    ctrlc::set_handler(move || stop.store(true, std::sync::atomic::Ordering::Relaxed))?;
     browse::browse(archive, &opts, |point| {
         // Scripts (and the tests) wait for this line.
         println!("{}", point.to_string_lossy());
