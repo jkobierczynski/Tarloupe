@@ -508,8 +508,9 @@ impl Read for Counted<'_, '_> {
 
 impl Seek for Counted<'_, '_> {
     fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        // Not reported: setting up the walker seeks to the end to learn the
+        // length and back, and the next read reports the real position.
         self.pos = self.inner.seek(to)?;
-        self.report.at(self.pos);
         Ok(self.pos)
     }
 }

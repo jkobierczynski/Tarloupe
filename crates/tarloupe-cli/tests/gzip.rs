@@ -327,6 +327,7 @@ fn indexing_reports_progress_up_to_the_file_size() {
         assert_eq!(v.first(), Some(&(0, size)));
         assert_eq!(v.last(), Some(&(size, size)));
         assert!(v.iter().all(|&(d, t)| t == size && d <= size));
+        assert!(v.windows(2).all(|w| w[0].0 <= w[1].0), "went back: {v:?}");
         // Loading the finished index reports nothing.
         Archive::open(path, &opts).unwrap();
         assert!(seen.lock().unwrap().is_empty());

@@ -54,7 +54,7 @@ fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
 }
 
 /// A stable 64-bit FNV-1a hash (the same in every build of both programs).
-fn fnv(bytes: impl IntoIterator<Item = u16>) -> u64 {
+pub fn fnv(bytes: impl IntoIterator<Item = u16>) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
         for x in b.to_le_bytes() {

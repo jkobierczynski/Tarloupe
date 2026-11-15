@@ -103,11 +103,15 @@ fn second_browse_goes_to_the_running_agent() {
     let first = sample(dir.path(), "first.tar", b"one");
     let second = sample(dir.path(), "second.tar", b"two");
 
+    // The agent is keyed by the index folder, so this one is the test's own
+    // even if the user runs Tarloupe.
     let mut guard = Guard(Some(tarloupew(&idx, &first).spawn().unwrap()));
     let agent = guard.0.as_mut().unwrap();
     let points = wait_for_mounts(&state, 1, agent);
     let one = PathBuf::from(format!("{}\\", points[0]));
     assert_eq!(fs::read(one.join("A.TXT")).unwrap(), b"one");
+    // Keeps the first archive mounted for the rest of the test.
+    let held = File::open(one.join("a.txt")).unwrap();
 
     // A second tarloupew hands its archive over and exits at once.
     let mut c = tarloupew(&idx, &second).spawn().unwrap();
@@ -131,8 +135,7 @@ fn second_browse_goes_to_the_running_agent() {
         .unwrap();
     assert_eq!(fs::read(two.join("a.txt")).unwrap(), b"two");
 
-    // An open file keeps its archive mounted; the other goes idle.
-    let held = File::open(one.join("a.txt")).unwrap();
+    // The open file keeps its archive mounted; the other goes idle.
     std::thread::sleep(Duration::from_secs(10));
     assert!(agent.try_wait().unwrap().is_none(), "the agent left early");
     assert!(

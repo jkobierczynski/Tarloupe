@@ -36,9 +36,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::browse;
 
-const CLASS: &str = "Tarloupe.Agent";
-/// Serialises finding, starting and leaving the agent.
-const LOCK: &str = "Local\\Tarloupe-agent";
 /// Marks a WM_COPYDATA that carries an archive path.
 const COPY_PATH: usize = 0x544c_5550;
 /// The tray icon's mouse messages.
@@ -62,9 +59,21 @@ pub struct Settings {
 pub fn run(archive: &Path, settings: Settings) -> Result<()> {
     let path = std::fs::canonicalize(archive)
         .with_context(|| format!("cannot open {}", archive.display()))?;
-    let lock = Lock::new()?;
+    // One agent per index folder (normally one per session), so a test
+    // with its own index folder never talks to the user's agent.
+    let tag = format!(
+        "{:016x}",
+        browse::fnv(
+            tarloupe_core::index::default_index_dir()
+                .as_os_str()
+                .encode_wide()
+        )
+    );
+    let class_name = format!("Tarloupe.Agent.{tag}");
+    // Serialises finding, starting and leaving the agent.
+    let lock = Lock::new(&format!("Local\\Tarloupe-agent-{tag}"))?;
     lock.acquire()?;
-    let class = wide(CLASS);
+    let class = wide(&class_name);
     if let Ok(hwnd) = unsafe { FindWindowW(PCWSTR(class.as_ptr()), PCWSTR::null()) } {
         let r = forward(hwnd, &path);
         lock.release();
@@ -72,6 +81,7 @@ pub fn run(archive: &Path, settings: Settings) -> Result<()> {
     }
     let agent = AGENT.get_or_init(|| Agent {
         settings,
+        class: class_name,
         jobs: Mutex::default(),
         next_id: Mutex::new(0),
         quitting: AtomicBool::new(false),
@@ -133,6 +143,8 @@ struct Job {
     path: PathBuf,
     state: State,
     stop: Arc<AtomicBool>,
+    /// Asked for again while it was being unmounted: browse it anew then.
+    again: bool,
 }
 
 #[derive(Clone)]
@@ -143,6 +155,8 @@ enum State {
 
 struct Agent {
     settings: Settings,
+    /// The window class that other `tarloupew`s look for.
+    class: String,
     jobs: Mutex<Vec<Job>>,
     next_id: Mutex<usize>,
     quitting: AtomicBool,
@@ -171,7 +185,11 @@ impl Agent {
             return false;
         }
         let mut jobs = self.jobs.lock().unwrap();
-        if let Some(j) = jobs.iter().find(|j| j.path == path) {
+        if let Some(j) = jobs.iter_mut().find(|j| j.path == path) {
+            if j.stop.load(Ordering::Relaxed) {
+                j.again = true;
+                return true;
+            }
             // Clicked again: open another window once it is mounted. While
             // it is still indexing, the window it opens then is enough.
             if let (State::Mounted(p), true) = (&j.state, self.settings.open_window) {
@@ -190,6 +208,7 @@ impl Agent {
             path: path.clone(),
             state: State::Indexing(0),
             stop: stop.clone(),
+            again: false,
         });
         drop(jobs);
         self.refresh();
@@ -208,7 +227,15 @@ impl Agent {
             let r = browse::browse(&path, &opts, |point| {
                 self.set_state(id, State::Mounted(point.to_os_string()))
             });
-            self.jobs.lock().unwrap().retain(|j| j.id != id);
+            let again = {
+                let mut jobs = self.jobs.lock().unwrap();
+                let again = jobs.iter().any(|j| j.id == id && j.again);
+                jobs.retain(|j| j.id != id);
+                again
+            };
+            if again {
+                self.start(path);
+            }
             self.refresh();
             if let Err(e) = r {
                 browse::message_box(&format!("{e:#}"));
@@ -370,7 +397,7 @@ fn describe(j: &Job) -> String {
 }
 
 fn create_window(agent: &'static Agent) -> Result<HWND> {
-    let class = wide(CLASS);
+    let class = wide(&agent.class);
     let title = wide("Tarloupe");
     let instance = unsafe { GetModuleHandleW(None) }.context("cannot start the tray agent")?;
     let wc = WNDCLASSW {
@@ -454,7 +481,7 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
     }
 }
 
-/// The named mutex that `LOCK` names.
+/// A named mutex.
 struct Lock(HANDLE);
 
 // The handle is only a kernel object reference; any thread may use it.
@@ -462,8 +489,8 @@ unsafe impl Send for Lock {}
 unsafe impl Sync for Lock {}
 
 impl Lock {
-    fn new() -> Result<Lock> {
-        let name = wide(LOCK);
+    fn new(name: &str) -> Result<Lock> {
+        let name = wide(name);
         let h = unsafe { CreateMutexW(None, false, PCWSTR(name.as_ptr())) }
             .context("cannot create the agent lock")?;
         Ok(Lock(h))
