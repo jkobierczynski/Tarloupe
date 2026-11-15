@@ -7,6 +7,7 @@
 //!   with a realistic size spread and partly compressible content, streamed
 //!   without touching the disk except for the output.
 
+pub mod gz;
 pub mod writer;
 
 use std::io::{self, Read, Write};

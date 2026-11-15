@@ -12,6 +12,7 @@ thiserror.workspace = true
 rusqlite.workspace = true
 xxhash-rust.workspace = true
 dirs.workspace = true
+libz-rs-sys.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

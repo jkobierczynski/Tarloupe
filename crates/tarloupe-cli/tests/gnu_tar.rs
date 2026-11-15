@@ -163,6 +163,29 @@ fn edge_corpus_matches_gnu_tar() {
 }
 
 #[test]
+fn gzip_archives_match_gnu_tar() {
+    let Some(tar) = gnu_tar() else { return };
+    if Command::new("gzip").arg("--version").output().is_err() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let plain = dir.path().join("edge.tar");
+    write_edge(File::create(&plain).unwrap(), Format::Pax).unwrap();
+    for level in ["-1", "-9"] {
+        let out = Command::new("gzip")
+            .args([level, "-c"])
+            .arg(&plain)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let path = dir.path().join(format!("edge{level}.tar.gz"));
+        fs::write(&path, out.stdout).unwrap();
+        assert_same_listing(tar, &path, &dir.path().join("idx"));
+        assert_same_contents(tar, &path, &dir.path().join("idx"));
+    }
+}
+
+#[test]
 #[cfg(unix)]
 fn gnu_tar_created_archives_with_sparse_files() {
     use std::io::{Seek, SeekFrom};
@@ -314,8 +337,8 @@ fn browsing_follows_tar_semantics() {
 #[test]
 fn compressed_archives_get_a_clear_message() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("a.tar.gz");
-    fs::write(&path, [0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]).unwrap();
+    let path = dir.path().join("a.tar.xz");
+    fs::write(&path, [0xfd, b'7', b'z', b'X', b'Z', 0, 0, 4]).unwrap();
     let out = tarloupe(&dir.path().join("idx"))
         .arg("list")
         .arg(&path)
@@ -323,7 +346,7 @@ fn compressed_archives_get_a_clear_message() {
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("gzip") && err.contains("M1"), "{err}");
+    assert!(err.contains("xz") && err.contains("M3"), "{err}");
 }
 
 #[test]

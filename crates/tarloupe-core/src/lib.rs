@@ -10,6 +10,7 @@ pub mod archive;
 pub mod codec;
 pub mod entry;
 pub mod error;
+pub mod gzip;
 pub mod header;
 pub mod index;
 pub mod key;

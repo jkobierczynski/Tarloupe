@@ -1,6 +1,7 @@
 //! `tarloupe`: index, list and read huge tar archives without extracting them.
 
 use std::ffi::OsString;
+use std::fs;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -31,6 +32,10 @@ struct IndexOpts {
     /// Directory for cached index files (default: the per-user Tarloupe index folder).
     #[arg(long, global = true, value_name = "DIR")]
     index_dir: Option<PathBuf>,
+    /// Distance between gzip restart points when building an index, e.g. 8M
+    /// (default). Smaller makes random reads faster and the index larger.
+    #[arg(long, global = true, value_name = "SIZE", value_parser = parse_size)]
+    checkpoint_spacing: Option<u64>,
 }
 
 #[derive(Subcommand)]
@@ -66,6 +71,19 @@ enum Cmd {
         #[command(flatten)]
         idx: IndexOpts,
     },
+    /// Extract files from the archive into a directory.
+    #[command(visible_alias = "x")]
+    Extract {
+        archive: PathBuf,
+        /// Members to extract (default: everything). Directories are
+        /// extracted with their contents.
+        paths: Vec<OsString>,
+        /// Destination directory.
+        #[arg(short = 'C', long, default_value = ".")]
+        directory: PathBuf,
+        #[command(flatten)]
+        idx: IndexOpts,
+    },
     /// Write the contents of one or more files to standard output.
     Cat {
         archive: PathBuf,
@@ -82,6 +100,7 @@ fn open(archive: &PathBuf, idx: &IndexOpts, rebuild: bool) -> Result<Archive> {
         index_dir: idx.index_dir.clone(),
         rebuild,
         require_index: false,
+        checkpoint_spacing: idx.checkpoint_spacing,
     };
     let start = Instant::now();
     let a = Archive::open(archive, &opts)
@@ -93,8 +112,44 @@ fn open(archive: &PathBuf, idx: &IndexOpts, rebuild: bool) -> Result<Archive> {
             start.elapsed(),
             a.index_path().display()
         );
+        let points: u64 = a
+            .index()
+            .meta("checkpoint_count")?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        let size = fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
+        if a.codec() == tarloupe_core::Codec::Gzip && points <= 1 && size > 32 << 20 {
+            eprintln!(
+                "tarloupe: warning: this gzip file is one huge deflate block (as some \
+                 fast compressors write), so every read decodes from the start. \
+                 Recompressing it with gzip or pigz makes reads fast."
+            );
+        }
     }
     Ok(a)
+}
+
+mod extract;
+
+/// Parses a size such as `512K`, `8M` or `1G` (binary units).
+fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num, mult) = match s.char_indices().last() {
+        Some((i, c)) if c.is_ascii_alphabetic() => (
+            &s[..i],
+            match c.to_ascii_uppercase() {
+                'K' => 1u64 << 10,
+                'M' => 1 << 20,
+                'G' => 1 << 30,
+                _ => return Err(format!("unknown size suffix in {s:?}")),
+            },
+        ),
+        _ => (s, 1),
+    };
+    num.parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .ok_or_else(|| format!("invalid size {s:?}"))
 }
 
 fn run(cli: Cli) -> Result<()> {
@@ -113,9 +168,13 @@ fn run(cli: Cli) -> Result<()> {
                 IndexStatus::Built => "built",
                 IndexStatus::Rebuilt => "rebuilt",
             };
+            let points = a
+                .index()
+                .meta("checkpoint_count")?
+                .unwrap_or_else(|| "0".into());
             writeln!(
                 out,
-                "{status}: {members} members, index {}",
+                "{status}: {members} members, {points} checkpoints, index {}",
                 a.index_path().display()
             )?;
         }
@@ -185,6 +244,45 @@ fn run(cli: Cli) -> Result<()> {
                     out.write_all(&quote(&e.link_target))?;
                 }
                 out.write_all(b"\n")?;
+            }
+        }
+        Cmd::Extract {
+            archive,
+            paths,
+            directory,
+            idx,
+        } => {
+            let a = open(&archive, &idx, false)?;
+            let mut todo = Vec::new();
+            if paths.is_empty() {
+                todo.extend(a.list_dir(b"")?);
+            }
+            for p in &paths {
+                let name = p.to_string_lossy();
+                todo.push(
+                    a.lookup(p.as_encoded_bytes())?
+                        .with_context(|| format!("{name}: not found in archive"))?,
+                );
+            }
+            fs::create_dir_all(&directory)
+                .with_context(|| format!("cannot create {}", directory.display()))?;
+            let mut problems = 0usize;
+            while let Some(e) = todo.pop() {
+                match extract::one(&a, &e, &directory) {
+                    Ok(Some(children)) => todo.extend(children),
+                    Ok(None) => {}
+                    Err(err) => {
+                        problems += 1;
+                        eprintln!(
+                            "tarloupe: {}: {}",
+                            String::from_utf8_lossy(&quote(&e.path)),
+                            escape_controls(&format!("{err:#}"))
+                        );
+                    }
+                }
+            }
+            if problems > 0 {
+                anyhow::bail!("{problems} member(s) were not extracted");
             }
         }
         Cmd::Cat {

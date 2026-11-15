@@ -4,8 +4,8 @@
 //! - `meta`: format version, codec, archive key, counts.
 //! - `entries`: one row per member in archive order, plus synthesised
 //!   parent directories. Lookups ignore superseded rows (last one wins).
-//! - `checkpoints`: decoder restart points for compressed streams; created
-//!   now and filled from M1 (gzip) on.
+//! - `checkpoints`: decoder restart points for compressed streams (gzip:
+//!   bit offset plus the zlib-compressed 32 KiB window before it).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -15,6 +15,7 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use crate::codec::Codec;
 use crate::entry::{decode_sparse, encode_sparse, Entry, EntryKind};
 use crate::error::{Error, Result};
+use crate::gzip::{Checkpoint, Point};
 use crate::key::ArchiveKey;
 use crate::path::parent;
 
@@ -140,13 +141,19 @@ pub struct Index {
 
 impl Index {
     /// Writes a new index atomically (temp file + rename).
-    pub fn create(path: &Path, key: &ArchiveKey, codec: Codec, entries: &[Entry]) -> Result<Index> {
+    pub fn create(
+        path: &Path,
+        key: &ArchiveKey,
+        codec: Codec,
+        entries: &[Entry],
+        checkpoints: &[Checkpoint],
+    ) -> Result<Index> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = unique_temp_path(path)?;
-        let result =
-            Index::write(&tmp, key, codec, entries).and_then(|()| Ok(std::fs::rename(&tmp, path)?));
+        let result = Index::write(&tmp, key, codec, entries, checkpoints)
+            .and_then(|()| Ok(std::fs::rename(&tmp, path)?));
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
         }
@@ -155,7 +162,13 @@ impl Index {
         Index::open(path, key)
     }
 
-    fn write(tmp: &Path, key: &ArchiveKey, codec: Codec, entries: &[Entry]) -> Result<()> {
+    fn write(
+        tmp: &Path,
+        key: &ArchiveKey,
+        codec: Codec,
+        entries: &[Entry],
+        checkpoints: &[Checkpoint],
+    ) -> Result<()> {
         {
             let mut conn = Connection::open(tmp)?;
             conn.execute_batch(
@@ -176,6 +189,7 @@ impl Index {
                     ("archive_key", key.id()),
                     ("entry_count", entries.len().to_string()),
                     ("member_count", members.to_string()),
+                    ("checkpoint_count", checkpoints.len().to_string()),
                 ] {
                     meta.execute(params![k, v])?;
                 }
@@ -210,6 +224,17 @@ impl Index {
                         e.sparse.as_deref().map(encode_sparse),
                         e.implicit,
                         e.superseded,
+                    ])?;
+                }
+                let mut cp = tx.prepare(
+                    "INSERT INTO checkpoints (uncompressed_offset, compressed_bit_offset, state) \
+                     VALUES (?1, ?2, ?3)",
+                )?;
+                for c in checkpoints {
+                    cp.execute(params![
+                        c.uncompressed_offset as i64,
+                        c.bit_offset as i64,
+                        c.window
                     ])?;
                 }
             }
@@ -261,6 +286,30 @@ impl Index {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// All decoder restart points, in stream order (windows not loaded).
+    pub fn checkpoints(&self) -> Result<Vec<Point>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uncompressed_offset, compressed_bit_offset FROM checkpoints \
+             ORDER BY uncompressed_offset",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(Point {
+                uncompressed_offset: r.get::<_, i64>(0)? as u64,
+                bit_offset: r.get::<_, i64>(1)? as u64,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The packed window stored with the checkpoint at `uncompressed_offset`.
+    pub fn checkpoint_window(&self, uncompressed_offset: u64) -> Result<Vec<u8>> {
+        Ok(self.conn.query_row(
+            "SELECT state FROM checkpoints WHERE uncompressed_offset = ?1",
+            [uncompressed_offset as i64],
+            |r| Ok(r.get::<_, Option<Vec<u8>>>(0)?.unwrap_or_default()),
+        )?)
     }
 
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
