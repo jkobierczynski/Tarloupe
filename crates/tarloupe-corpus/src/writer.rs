@@ -174,11 +174,18 @@ impl<W: Write> TarWriter<W> {
                 }
             }
             Format::Ustar => {
+                let (dev_major, dev_minor) = match m.kind {
+                    Kind::CharDev(a, b) => (a, b),
+                    _ => (0, 0),
+                };
                 if link.len() > 100
                     || size > OCTAL_SIZE_MAX
                     || m.uid > OCTAL_ID_MAX
                     || m.gid > OCTAL_ID_MAX
                     || m.mtime < 0
+                    || m.mtime as u64 > OCTAL_SIZE_MAX
+                    || dev_major > OCTAL_ID_MAX
+                    || dev_minor > OCTAL_ID_MAX
                 {
                     self.skipped
                         .push(String::from_utf8_lossy(&m.path).into_owned());

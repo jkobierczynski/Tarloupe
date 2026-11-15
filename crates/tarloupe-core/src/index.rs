@@ -143,10 +143,19 @@ impl Index {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_extension(format!("tli.tmp-{}", std::process::id()));
-        let _ = std::fs::remove_file(&tmp);
+        let tmp = unique_temp_path(path)?;
+        let result =
+            Index::write(&tmp, key, codec, entries).and_then(|()| Ok(std::fs::rename(&tmp, path)?));
+        if result.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        result?;
+        Index::open_unchecked(path)
+    }
+
+    fn write(tmp: &Path, key: &ArchiveKey, codec: Codec, entries: &[Entry]) -> Result<()> {
         {
-            let mut conn = Connection::open(&tmp)?;
+            let mut conn = Connection::open(tmp)?;
             conn.execute_batch(
                 "PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; PRAGMA page_size = 8192;",
             )?;
@@ -206,8 +215,7 @@ impl Index {
             conn.execute_batch(INDEXES)?;
             conn.execute_batch("ANALYZE;")?;
         }
-        std::fs::rename(&tmp, path)?;
-        Index::open_unchecked(path)
+        Ok(())
     }
 
     fn open_unchecked(path: &Path) -> Result<Index> {
@@ -238,8 +246,12 @@ impl Index {
             )));
         }
         let size = idx.meta("archive_size")?.unwrap_or_default();
+        let mtime = idx.meta("archive_mtime_ns")?.unwrap_or_default();
         let hash = idx.meta("archive_sample_hash")?.unwrap_or_default();
-        if size != key.size.to_string() || hash != format!("{:016x}", key.sample_hash) {
+        if size != key.size.to_string()
+            || mtime != key.mtime_ns.to_string()
+            || hash != format!("{:016x}", key.sample_hash)
+        {
             return Err(stale("the archive has changed since it was indexed".into()));
         }
         Ok(idx)
@@ -291,6 +303,22 @@ impl Index {
             .optional()?)
     }
 
+    /// The latest member with this path that precedes member `before`,
+    /// including superseded ones. Hard links refer to data that was
+    /// archived before them, even when the link reuses the same path.
+    pub fn lookup_before(&self, path: &[u8], before: i64) -> Result<Option<Entry>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!(
+                    "SELECT {COLUMNS} FROM entries WHERE path = ?1 AND id < ?2 AND implicit = 0 ORDER BY id DESC LIMIT 1"
+                ),
+                params![path, before],
+                row_to_entry,
+            )
+            .optional()?)
+    }
+
     /// Current children of a directory (0 = archive root), sorted by name.
     pub fn children(&self, dir_id: i64) -> Result<Vec<Entry>> {
         let mut stmt = self.conn.prepare(&format!(
@@ -298,6 +326,30 @@ impl Index {
         ))?;
         let rows = stmt.query_map([dir_id], row_to_entry)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+/// Creates (exclusively) a temporary file next to `path` that no other
+/// builder, in this or another process, can be using.
+fn unique_temp_path(path: &Path) -> Result<PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    loop {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("tli.tmp-{}-{n}-{nanos:x}", std::process::id()));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(_) => return Ok(tmp),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
     }
 }
 

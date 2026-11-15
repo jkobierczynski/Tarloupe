@@ -26,12 +26,12 @@ impl TarTvFormatter {
         let user = if e.uname.is_empty() {
             e.uid.to_string().into_bytes()
         } else {
-            e.uname.clone()
+            quote(&e.uname)
         };
         let group = if e.gname.is_empty() {
             e.gid.to_string().into_bytes()
         } else {
-            e.gname.clone()
+            quote(&e.gname)
         };
         let size = match e.typeflag {
             header::CHRTYPE | header::BLKTYPE => format!("{},{}", e.dev_major, e.dev_minor),

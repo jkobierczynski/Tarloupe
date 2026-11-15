@@ -36,6 +36,14 @@ impl Codec {
     /// should be passed when available). Returns `None` when the data is
     /// neither a known compressed format nor a tar header.
     pub fn detect(head: &[u8]) -> Option<Codec> {
+        // A valid tar header wins over magic prefixes: a plain tar whose
+        // first member is named e.g. `BZh-report.txt` starts with `BZh`.
+        if head.len() >= 512 {
+            let block: &[u8; 512] = head[..512].try_into().unwrap();
+            if !header::is_zero_block(block) && header::checksum_ok(block) {
+                return Some(Codec::None);
+            }
+        }
         if head.starts_with(&[0x1f, 0x8b]) {
             Some(Codec::Gzip)
         } else if head.starts_with(b"BZh") {
@@ -60,5 +68,24 @@ impl Codec {
         } else {
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tar_member_named_like_a_magic_number() {
+        let mut h = [0u8; 512];
+        h[..14].copy_from_slice(b"BZh-report.txt");
+        h[100..108].copy_from_slice(b"0000644\0");
+        h[124..136].copy_from_slice(b"00000000000\0");
+        h[156] = b'0';
+        h[148..156].fill(b' ');
+        let sum: u64 = h.iter().map(|&b| b as u64).sum();
+        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        assert_eq!(Codec::detect(&h), Some(Codec::None));
+        assert_eq!(Codec::detect(b"BZh91AY&SY"), Some(Codec::Bzip2));
     }
 }

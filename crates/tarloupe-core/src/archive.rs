@@ -1,7 +1,7 @@
 //! High-level API: open an archive with its index, browse, and read.
 
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::codec::Codec;
@@ -55,9 +55,19 @@ impl Archive {
                 milestone: codec.milestone(),
             });
         }
-        let key = ArchiveKey::compute(&path)?;
+        // Key and index come from the handle we keep for reads, so they
+        // describe the same file even if the path is replaced meanwhile.
+        let key = ArchiveKey::from_file(&file)?;
         let index_path = match &opts.index_path {
-            Some(p) => p.clone(),
+            Some(p) => {
+                if same_file(&path, p) {
+                    return Err(Error::Unsupported(format!(
+                        "the index path {} is the archive itself",
+                        p.display()
+                    )));
+                }
+                p.clone()
+            }
             None => opts
                 .index_dir
                 .clone()
@@ -68,9 +78,11 @@ impl Archive {
         let (index, status) = if !opts.rebuild && index_path.exists() {
             match Index::open(&index_path, &key) {
                 Ok(i) => (i, IndexStatus::Loaded),
-                Err(e @ Error::StaleIndex { .. }) if opts.require_index => return Err(e),
+                Err(e @ (Error::StaleIndex { .. } | Error::Sqlite(_))) if opts.require_index => {
+                    return Err(e)
+                }
                 Err(Error::StaleIndex { .. }) | Err(Error::Sqlite(_)) => (
-                    build_index(&path, &index_path, &key, codec)?,
+                    build_index(&file, &index_path, &key, codec)?,
                     IndexStatus::Rebuilt,
                 ),
                 Err(e) => return Err(e),
@@ -83,7 +95,7 @@ impl Archive {
             } else {
                 IndexStatus::Built
             };
-            (build_index(&path, &index_path, &key, codec)?, st)
+            (build_index(&file, &index_path, &key, codec)?, st)
         };
 
         Ok(Archive {
@@ -139,7 +151,10 @@ impl Archive {
                 e.display_path()
             )));
         }
-        self.index.children(e.id)
+        // The root (an explicit `./` member, or a link to `/`) lists the
+        // top-level entries, whose parent is the virtual root 0.
+        self.index
+            .children(if e.path.is_empty() { 0 } else { e.id })
     }
 
     /// Follows hard links and symlinks until reaching an entry that has
@@ -147,7 +162,19 @@ impl Archive {
     pub fn resolve(&self, mut e: Entry) -> Result<Entry> {
         for _ in 0..MAX_LINK_HOPS {
             let target = match e.kind {
-                EntryKind::HardLink => normalize(&e.link_target),
+                EntryKind::HardLink => {
+                    // A hard link names data archived before it, which may
+                    // since have been superseded (even by the link itself).
+                    let target = normalize(&e.link_target);
+                    e = self.index.lookup_before(&target, e.id)?.ok_or_else(|| {
+                        Error::NotFound(format!(
+                            "{} => {} (hard link target not found)",
+                            e.display_path(),
+                            String::from_utf8_lossy(&target)
+                        ))
+                    })?;
+                    continue;
+                }
                 EntryKind::Symlink => resolve_link(&e.path, &e.link_target).ok_or_else(|| {
                     Error::NotFound(format!(
                         "{} -> {} (escapes the archive)",
@@ -157,23 +184,17 @@ impl Archive {
                 })?,
                 _ => return Ok(e),
             };
-            let next = self.index.lookup(&target)?.ok_or_else(|| {
+            if target.is_empty() {
+                e = self.index.lookup(b"")?.unwrap_or_else(root_entry);
+                continue;
+            }
+            e = self.index.lookup(&target)?.ok_or_else(|| {
                 Error::NotFound(format!(
                     "{} -> {} (dangling link)",
                     e.display_path(),
                     String::from_utf8_lossy(&target)
                 ))
             })?;
-            // A hard link that names itself (a later duplicate) points at the
-            // earlier member that carried the data.
-            e = if next.id == e.id && e.kind == EntryKind::HardLink {
-                return Err(Error::NotFound(format!(
-                    "{} links to itself",
-                    e.display_path()
-                )));
-            } else {
-                next
-            };
         }
         Err(Error::Unsupported(format!(
             "too many levels of links at {}",
@@ -252,10 +273,61 @@ fn detect(file: &mut File) -> Result<Codec> {
     Codec::detect(&head[..n]).ok_or(Error::NotTar)
 }
 
-fn build_index(archive: &Path, index_path: &Path, key: &ArchiveKey, codec: Codec) -> Result<Index> {
-    let file = File::open(archive)?;
-    let src = SeekSource::new(std::io::BufReader::with_capacity(64 * 1024, file))?;
+/// Synthetic entry for the archive root when it has no `./` member.
+fn root_entry() -> Entry {
+    Entry {
+        id: 0,
+        parent_id: 0,
+        path: Vec::new(),
+        raw_name: Vec::new(),
+        typeflag: crate::header::DIRTYPE,
+        kind: EntryKind::Dir,
+        mode: 0o755,
+        uid: 0,
+        gid: 0,
+        uname: Vec::new(),
+        gname: Vec::new(),
+        mtime: 0,
+        size: 0,
+        link_target: Vec::new(),
+        dev_major: 0,
+        dev_minor: 0,
+        header_offset: 0,
+        data_offset: 0,
+        stored_size: 0,
+        sparse: None,
+        implicit: true,
+        superseded: false,
+    }
+}
+
+/// True when both paths name the same file (through any alias). A path
+/// that does not exist yet is compared through its canonical parent.
+fn same_file(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| -> Option<PathBuf> {
+        if let Ok(c) = p.canonicalize() {
+            return Some(c);
+        }
+        let parent = match p.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.canonicalize().ok()?,
+            _ => std::env::current_dir().ok()?,
+        };
+        Some(parent.join(p.file_name()?))
+    };
+    matches!((canon(a), canon(b)), (Some(x), Some(y)) if x == y)
+}
+
+fn build_index(file: &File, index_path: &Path, key: &ArchiveKey, codec: Codec) -> Result<Index> {
+    let mut reader = file.try_clone()?;
+    reader.seek(SeekFrom::Start(0))?;
+    let src = SeekSource::new(std::io::BufReader::with_capacity(64 * 1024, reader))?;
     let members = Walker::new(src).collect::<Result<Vec<_>>>()?;
+    // Refuse to publish an index if the file changed while it was read.
+    if ArchiveKey::from_file(file)? != *key {
+        return Err(Error::Unsupported(
+            "the archive changed while it was being indexed; try again".into(),
+        ));
+    }
     let entries = build_tree(members);
     Index::create(index_path, key, codec, &entries)
 }

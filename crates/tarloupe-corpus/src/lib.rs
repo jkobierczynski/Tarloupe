@@ -33,12 +33,13 @@ impl Rng {
 }
 
 /// Deterministic content: runs of pseudo-text (compresses well) mixed with
-/// runs of random bytes (does not), so codecs see realistic data.
+/// runs of random bytes (does not), so codecs see realistic data. The
+/// stream depends only on the seed and length, never on read sizes.
 pub struct Content {
     rng: Rng,
     left: u64,
-    run_left: usize,
-    text: bool,
+    run: Vec<u8>,
+    pos: usize,
 }
 
 const WORDS: &[&str] = &[
@@ -52,9 +53,30 @@ impl Content {
         Content {
             rng: Rng::new(seed),
             left: len,
-            run_left: 0,
-            text: true,
+            run: Vec::new(),
+            pos: 0,
         }
+    }
+
+    /// Generates the next whole run into `self.run`.
+    fn refill(&mut self) {
+        let text = self.rng.below(10) < 7;
+        let len = 256 + self.rng.below(16 * 1024) as usize;
+        self.run.clear();
+        self.pos = 0;
+        if text {
+            while self.run.len() < len {
+                let w = WORDS[self.rng.below(WORDS.len() as u64) as usize].as_bytes();
+                self.run.extend_from_slice(w);
+                self.run.push(b' ');
+            }
+        } else {
+            while self.run.len() < len {
+                self.run
+                    .extend_from_slice(&self.rng.next_u64().to_le_bytes());
+            }
+        }
+        self.run.truncate(len);
     }
 }
 
@@ -63,31 +85,13 @@ impl Read for Content {
         let n = (buf.len() as u64).min(self.left) as usize;
         let mut i = 0;
         while i < n {
-            if self.run_left == 0 {
-                self.text = self.rng.below(10) < 7;
-                self.run_left = 256 + self.rng.below(16 * 1024) as usize;
+            if self.pos == self.run.len() {
+                self.refill();
             }
-            let take = self.run_left.min(n - i);
-            if self.text {
-                let mut j = 0;
-                while j < take {
-                    let w = WORDS[self.rng.below(WORDS.len() as u64) as usize].as_bytes();
-                    for &c in w.iter().chain(b" ".iter()) {
-                        if j == take {
-                            break;
-                        }
-                        buf[i + j] = c;
-                        j += 1;
-                    }
-                }
-            } else {
-                for chunk in buf[i..i + take].chunks_mut(8) {
-                    let r = self.rng.next_u64().to_le_bytes();
-                    chunk.copy_from_slice(&r[..chunk.len()]);
-                }
-            }
+            let take = (self.run.len() - self.pos).min(n - i);
+            buf[i..i + take].copy_from_slice(&self.run[self.pos..self.pos + take]);
+            self.pos += take;
             i += take;
-            self.run_left -= take;
         }
         self.left -= n as u64;
         Ok(n)
@@ -297,7 +301,7 @@ pub fn write_bulk<W: Write>(w: W, format: Format, size: u64, seed: u64) -> io::R
         // About 200 files per leaf directory, 100 leaves per branch.
         let dir = format!("bulk/b{:03}/l{:03}", n / 20_000, (n / 200) % 100);
         if dir != last_dir {
-            if n % 20_000 == 0 {
+            if n.is_multiple_of(20_000) {
                 w.append(
                     &Member::new(format!("bulk/b{:03}", n / 20_000), Kind::Dir, 0, T0),
                     &mut io::empty(),
@@ -332,4 +336,31 @@ pub fn write_bulk<W: Write>(w: W, format: Format, size: u64, seed: u64) -> io::R
     }
     w.finish()?;
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn content_does_not_depend_on_read_size() {
+        let read_all = |chunk: usize| {
+            let mut c = Content::new(7, 100_000);
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; chunk];
+            loop {
+                let n = c.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        };
+        let whole = read_all(1 << 20);
+        assert_eq!(whole.len(), 100_000);
+        for chunk in [1, 7, 512, 4096] {
+            assert!(read_all(chunk) == whole, "chunk size {chunk}");
+        }
+    }
 }

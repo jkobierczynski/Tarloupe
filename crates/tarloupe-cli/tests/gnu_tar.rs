@@ -325,3 +325,90 @@ fn compressed_archives_get_a_clear_message() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("gzip") && err.contains("M1"), "{err}");
 }
+
+#[test]
+fn self_named_hard_links_and_links_to_the_root() {
+    use tarloupe_corpus::{Content, Kind, Member, TarWriter};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("links.tar");
+    let mut w = TarWriter::new(File::create(&path).unwrap(), Format::Gnu);
+    let f = Member::new("top/f", Kind::File, 100, 0);
+    w.append(&f, &mut Content::new(1, 100)).unwrap();
+    // `tar --hard-dereference`-less archives can repeat a path as a hard
+    // link to itself; the data is in the earlier member.
+    let l = Member::new("top/f", Kind::HardLink(b"top/f".to_vec()), 0, 0);
+    w.append(&l, &mut std::io::empty()).unwrap();
+    let r = Member::new("rootlink", Kind::Symlink(b"/".to_vec()), 0, 0);
+    w.append(&r, &mut std::io::empty()).unwrap();
+    w.finish().unwrap();
+
+    let opts = OpenOptions {
+        index_dir: Some(dir.path().join("idx")),
+        ..Default::default()
+    };
+    let a = Archive::open(&path, &opts).unwrap();
+    let mut buf = Vec::new();
+    a.copy_to(&a.lookup(b"top/f").unwrap().unwrap(), &mut buf)
+        .unwrap();
+    let mut want = Vec::new();
+    std::io::Read::read_to_end(&mut Content::new(1, 100), &mut want).unwrap();
+    assert_eq!(buf, want);
+
+    let names = |p: &[u8]| -> Vec<Vec<u8>> {
+        a.list_dir(p)
+            .unwrap()
+            .iter()
+            .map(|e| e.name().to_vec())
+            .collect()
+    };
+    assert_eq!(names(b"rootlink"), names(b""));
+}
+
+#[test]
+fn index_safety() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.tar");
+    write_edge(File::create(&path).unwrap(), Format::Gnu).unwrap();
+    let before = fs::read(&path).unwrap();
+
+    // The archive itself is never used as its index destination.
+    let alias = dir.path().join(".").join("a.tar");
+    let opts = OpenOptions {
+        index_path: Some(alias),
+        ..Default::default()
+    };
+    assert!(Archive::open(&path, &opts).is_err());
+    assert_eq!(fs::read(&path).unwrap(), before);
+
+    // A corrupt index is not silently rebuilt when one is required.
+    let sidecar = dir.path().join("a.tar.tli");
+    fs::write(&sidecar, b"not a database").unwrap();
+    let opts = OpenOptions {
+        index_path: Some(sidecar.clone()),
+        require_index: true,
+        ..Default::default()
+    };
+    assert!(Archive::open(&path, &opts).is_err());
+
+    // A sidecar is rejected when only the archive's mtime changed.
+    let opts = OpenOptions {
+        index_path: Some(sidecar),
+        ..Default::default()
+    };
+    assert_eq!(
+        Archive::open(&path, &opts).unwrap().index_status(),
+        IndexStatus::Rebuilt
+    );
+    let f = fs::OpenOptions::new().write(true).open(&path).unwrap();
+    f.set_modified(std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+        .unwrap();
+    drop(f);
+    assert_eq!(
+        Archive::open(&path, &opts).unwrap().index_status(),
+        IndexStatus::Rebuilt
+    );
+    assert_eq!(
+        Archive::open(&path, &opts).unwrap().index_status(),
+        IndexStatus::Loaded
+    );
+}

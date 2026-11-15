@@ -52,8 +52,9 @@ fn parse_size(s: &str) -> Result<u64, String> {
         _ => (s, 1),
     };
     num.parse::<u64>()
-        .map(|n| n * mult)
-        .map_err(|e| format!("invalid size {s:?}: {e}"))
+        .map_err(|e| format!("invalid size {s:?}: {e}"))?
+        .checked_mul(mult)
+        .ok_or_else(|| format!("size {s:?} is too large"))
 }
 
 fn open_output(path: &PathBuf) -> Result<Box<dyn Write>> {

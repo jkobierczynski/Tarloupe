@@ -1,5 +1,6 @@
 //! `tarloupe`: index, list and read huge tar archives without extracting them.
 
+use std::ffi::OsString;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -58,7 +59,7 @@ enum Cmd {
         archive: PathBuf,
         /// Directory inside the archive (default: the root).
         #[arg(default_value = "")]
-        path: String,
+        path: OsString,
         /// Long listing.
         #[arg(short, long)]
         long: bool,
@@ -69,7 +70,7 @@ enum Cmd {
     Cat {
         archive: PathBuf,
         #[arg(required = true)]
-        paths: Vec<String>,
+        paths: Vec<OsString>,
         #[command(flatten)]
         idx: IndexOpts,
     },
@@ -142,7 +143,7 @@ fn run(cli: Cli) -> Result<()> {
             idx,
         } => {
             let a = open(&archive, &idx, false)?;
-            for e in a.list_dir(path.as_bytes())? {
+            for e in a.list_dir(path.as_encoded_bytes())? {
                 if long {
                     // Hard links show the size of the data they share.
                     let size = match e.kind {
@@ -154,12 +155,12 @@ fn run(cli: Cli) -> Result<()> {
                     let user = if e.uname.is_empty() {
                         e.uid.to_string()
                     } else {
-                        String::from_utf8_lossy(&e.uname).into_owned()
+                        String::from_utf8_lossy(&quote(&e.uname)).into_owned()
                     };
                     let group = if e.gname.is_empty() {
                         e.gid.to_string()
                     } else {
-                        String::from_utf8_lossy(&e.gname).into_owned()
+                        String::from_utf8_lossy(&quote(&e.gname)).into_owned()
                     };
                     write!(
                         out,
@@ -193,11 +194,14 @@ fn run(cli: Cli) -> Result<()> {
         } => {
             let a = open(&archive, &idx, false)?;
             for p in paths {
+                // Operands keep their raw bytes, so names that are not
+                // valid UTF-8 can still be selected on Unix.
+                let name = p.to_string_lossy();
                 let e = a
-                    .lookup(p.as_bytes())?
-                    .with_context(|| format!("{p}: not found in archive"))?;
+                    .lookup(p.as_encoded_bytes())?
+                    .with_context(|| format!("{name}: not found in archive"))?;
                 a.copy_to(&e, &mut out)
-                    .with_context(|| format!("{p}: cannot read"))?;
+                    .with_context(|| format!("{name}: cannot read"))?;
             }
         }
     }
@@ -209,13 +213,40 @@ fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            if let Some(io) = e.downcast_ref::<io::Error>() {
-                if io.kind() == io::ErrorKind::BrokenPipe {
-                    return ExitCode::SUCCESS;
-                }
+            if is_broken_pipe(&e) {
+                return ExitCode::SUCCESS;
             }
-            eprintln!("tarloupe: {e:#}");
+            // Messages can contain names from the archive; never let them
+            // send control sequences to the terminal.
+            eprintln!("tarloupe: {}", escape_controls(&format!("{e:#}")));
             ExitCode::FAILURE
         }
     }
+}
+
+/// True when the error (or anything it wraps) is a closed output pipe,
+/// e.g. `tarloupe cat ... | head`.
+fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        let io = cause.downcast_ref::<io::Error>().or_else(|| {
+            match cause.downcast_ref::<tarloupe_core::Error>() {
+                Some(tarloupe_core::Error::Io(io)) => Some(io),
+                _ => None,
+            }
+        });
+        io.is_some_and(|io| io.kind() == io::ErrorKind::BrokenPipe)
+    })
+}
+
+/// Replaces control characters with visible escapes.
+fn escape_controls(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_control() {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }

@@ -316,6 +316,7 @@ impl<S: TarSource> Walker<S> {
                     .unwrap_or(stored_size);
                 sparse = Some(chunks);
                 let remaining = stored_size.saturating_sub(map_len);
+                validate_sparse(sparse.as_deref().unwrap_or_default(), size, remaining, at)?;
                 self.src.skip(padded(remaining)).map_err(|e| eof(e, at))?;
                 return Ok(self.build(
                     p.start.unwrap_or(at),
@@ -368,6 +369,9 @@ impl<S: TarSource> Walker<S> {
             }
         }
 
+        if let Some(chunks) = &sparse {
+            validate_sparse(chunks, size, stored_size, at)?;
+        }
         self.src.skip(padded(stored_size)).map_err(|e| eof(e, at))?;
         Ok(self.build(
             p.start.unwrap_or(at),
@@ -390,49 +394,59 @@ impl<S: TarSource> Walker<S> {
     }
 
     /// Reads the PAX 1.0 sparse map. Returns the chunks and the number of
-    /// bytes (whole blocks) the map occupies.
+    /// bytes (whole blocks) the map occupies. Each byte is parsed once.
     fn read_sparse_1_0(&mut self, stored_size: u64, at: u64) -> Result<(Vec<SparseChunk>, u64)> {
-        let mut buf: Vec<u8> = Vec::new();
         let mut block: Block = [0; 512];
+        let mut consumed: u64 = 0;
+        let mut count: Option<u64> = None;
         let mut numbers: Vec<u64> = Vec::new();
+        let mut current: Option<u64> = None; // digits of the number being read
         loop {
-            if buf.len() as u64 >= stored_size || buf.len() as u64 > MAX_META {
+            if count.is_some_and(|n| numbers.len() as u64 == n * 2) {
+                break;
+            }
+            if consumed >= stored_size || consumed > MAX_META {
                 return Err(Error::corrupt(at, "unterminated PAX 1.0 sparse map"));
             }
             let bat = self.src.position();
             if !self.src.read_block(&mut block).map_err(|e| eof(e, bat))? {
                 return Err(Error::corrupt(bat, "truncated PAX 1.0 sparse map"));
             }
-            buf.extend_from_slice(&block);
-            // Parse complete lines from the accumulated buffer.
-            numbers.clear();
-            let mut needed: Option<u64> = None;
-            let mut complete = false;
-            for line in buf.split_inclusive(|&c| c == b'\n') {
-                if !line.ends_with(b"\n") {
-                    break;
+            consumed += 512;
+            for &c in block.iter() {
+                if count.is_some_and(|n| numbers.len() as u64 == n * 2) {
+                    break; // the rest of the block is padding
                 }
-                let n = pax::parse_u64(&line[..line.len() - 1])
-                    .ok_or_else(|| Error::corrupt(bat, "invalid PAX 1.0 sparse map"))?;
-                if needed.is_none() {
-                    needed = Some(
-                        n.checked_mul(2)
-                            .ok_or_else(|| Error::corrupt(bat, "sparse map too large"))?,
-                    );
-                } else {
-                    numbers.push(n);
+                match c {
+                    b'0'..=b'9' => {
+                        let v = current.unwrap_or(0);
+                        current = Some(
+                            v.checked_mul(10)
+                                .and_then(|v| v.checked_add((c - b'0') as u64))
+                                .ok_or_else(|| {
+                                    Error::corrupt(bat, "number overflow in PAX 1.0 sparse map")
+                                })?,
+                        );
+                    }
+                    b'\n' => {
+                        let n = current.take().ok_or_else(|| {
+                            Error::corrupt(bat, "empty line in PAX 1.0 sparse map")
+                        })?;
+                        if count.is_none() {
+                            if n > MAX_META / 16 {
+                                return Err(Error::corrupt(bat, "PAX 1.0 sparse map too large"));
+                            }
+                            count = Some(n);
+                        } else {
+                            numbers.push(n);
+                        }
+                    }
+                    _ => return Err(Error::corrupt(bat, "invalid PAX 1.0 sparse map")),
                 }
-                if needed == Some(numbers.len() as u64) {
-                    complete = true;
-                    break;
-                }
-            }
-            if complete {
-                break;
             }
         }
         let pairs: Vec<(u64, u64)> = numbers.chunks_exact(2).map(|c| (c[0], c[1])).collect();
-        Ok((to_chunks(&pairs), buf.len() as u64))
+        Ok((to_chunks(&pairs), consumed))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -483,6 +497,37 @@ impl<S: TarSource> Walker<S> {
     }
 }
 
+/// Rejects sparse maps that would read outside the member: runs must be
+/// ordered, non-overlapping, inside the logical size, and their total
+/// length must fit in the stored data.
+fn validate_sparse(chunks: &[SparseChunk], size: u64, stored: u64, at: u64) -> Result<()> {
+    let mut prev_end = 0u64;
+    let mut total = 0u64;
+    for c in chunks {
+        let end = c
+            .offset
+            .checked_add(c.len)
+            .ok_or_else(|| Error::corrupt(at, "sparse run overflows"))?;
+        if c.offset < prev_end || end > size {
+            return Err(Error::corrupt(
+                at,
+                "sparse map is out of order or exceeds the file size",
+            ));
+        }
+        total = total
+            .checked_add(c.len)
+            .ok_or_else(|| Error::corrupt(at, "sparse map overflows"))?;
+        prev_end = end;
+    }
+    if total > stored {
+        return Err(Error::corrupt(
+            at,
+            "sparse map needs more data than the member stores",
+        ));
+    }
+    Ok(())
+}
+
 fn to_chunks(pairs: &[(u64, u64)]) -> Vec<SparseChunk> {
     pairs
         .iter()
@@ -509,5 +554,28 @@ impl<S: TarSource> Iterator for Walker<S> {
                 Some(Err(e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn c(offset: u64, len: u64) -> SparseChunk {
+        SparseChunk { offset, len }
+    }
+
+    #[test]
+    fn sparse_maps_are_validated() {
+        // Valid, with GNU's trailing zero-length run at the end of the file.
+        assert!(validate_sparse(&[c(0, 512), c(4096, 512), c(8192, 0)], 8192, 1024, 0).is_ok());
+        // Needs more data than stored: would read into the next header.
+        assert!(validate_sparse(&[c(0, 1024)], 1024, 512, 0).is_err());
+        // Beyond the logical size.
+        assert!(validate_sparse(&[c(0, 512), c(2048, 512)], 2048, 1024, 0).is_err());
+        // Overlapping / out of order.
+        assert!(validate_sparse(&[c(1024, 512), c(0, 512)], 4096, 1024, 0).is_err());
+        // Overflow.
+        assert!(validate_sparse(&[c(u64::MAX, 2)], u64::MAX, 2, 0).is_err());
     }
 }

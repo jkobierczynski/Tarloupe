@@ -26,7 +26,13 @@ pub struct ArchiveKey {
 
 impl ArchiveKey {
     pub fn compute(path: &Path) -> Result<ArchiveKey> {
-        let mut f = File::open(path)?;
+        ArchiveKey::from_file(&File::open(path)?)
+    }
+
+    /// Computes the key from an open handle, so the key describes exactly
+    /// the file that will be read (not whatever the path names later).
+    pub fn from_file(file: &File) -> Result<ArchiveKey> {
+        let mut f = file;
         let md = f.metadata()?;
         let size = md.len();
         let mtime_ns = md
@@ -40,6 +46,7 @@ impl ArchiveKey {
 
         let mut h = Xxh3::new();
         let mut buf = vec![0u8; SAMPLE.min(size) as usize];
+        f.seek(SeekFrom::Start(0))?;
         f.read_exact(&mut buf)?;
         h.update(&buf);
         if size > SAMPLE {
