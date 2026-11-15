@@ -1,6 +1,8 @@
 use std::ffi::{c_void, OsStr, OsString};
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tarloupe_core::vfs::{Node, Vfs};
 use tarloupe_core::{Archive, Error};
@@ -70,6 +72,7 @@ fn fsp(e: windows::core::Error) -> MountError {
 pub struct Mount {
     host: FileSystemHost<TarFs>,
     point: OsString,
+    activity: Arc<Activity>,
     _init: FspInit,
 }
 
@@ -77,6 +80,33 @@ impl Mount {
     /// Where the archive is mounted (a drive like `X:` or a folder).
     pub fn mount_point(&self) -> &OsStr {
         &self.point
+    }
+
+    /// Files and folders open on the mount right now. An Explorer window
+    /// showing a folder keeps it open.
+    pub fn open_handles(&self) -> usize {
+        self.activity.open.load(Ordering::Relaxed)
+    }
+
+    /// Time since anything was opened, read, listed or closed.
+    pub fn idle_for(&self) -> Duration {
+        let last = Duration::from_millis(self.activity.last_ms.load(Ordering::Relaxed));
+        self.activity.start.elapsed().saturating_sub(last)
+    }
+}
+
+/// What the idle check needs to know, shared with the file system.
+struct Activity {
+    start: Instant,
+    /// Milliseconds after `start` of the last request.
+    last_ms: AtomicU64,
+    open: AtomicUsize,
+}
+
+impl Activity {
+    fn touch(&self) {
+        let ms = self.start.elapsed().as_millis() as u64;
+        self.last_ms.fetch_max(ms, Ordering::Relaxed);
     }
 }
 
@@ -99,11 +129,17 @@ pub fn mount(archive: Arc<Archive>, point: Option<&OsStr>) -> Result<Mount, Moun
     let total = std::fs::metadata(archive.path())
         .map(|m| m.len())
         .unwrap_or(0);
+    let activity = Arc::new(Activity {
+        start: Instant::now(),
+        last_ms: AtomicU64::new(0),
+        open: AtomicUsize::new(0),
+    });
     let fs = TarFs {
         vfs: Vfs::new(archive).map_err(MountError::Archive)?,
         sd: security_descriptor()?,
         label,
         total,
+        activity: activity.clone(),
     };
 
     let mut params = VolumeParams::new();
@@ -118,7 +154,10 @@ pub fn mount(archive: Arc<Archive>, point: Option<&OsStr>) -> Result<Mount, Moun
         .unicode_on_disk(true)
         .persistent_acls(true)
         .read_only_volume(true)
-        .post_cleanup_when_modified_only(true)
+        // Cleanup marks the moment the last handle to a file is closed,
+        // which the idle check counts; Close can come much later, when the
+        // cache lets go of the file.
+        .post_cleanup_when_modified_only(false)
         // Nothing ever changes, so the kernel may cache metadata for long.
         .file_info_timeout(60_000)
         .dir_info_timeout(60_000)
@@ -134,6 +173,7 @@ pub fn mount(archive: Arc<Archive>, point: Option<&OsStr>) -> Result<Mount, Moun
     Ok(Mount {
         host,
         point,
+        activity,
         _init: init,
     })
 }
@@ -275,11 +315,14 @@ struct TarFs {
     sd: Vec<u8>,
     label: String,
     total: u64,
+    activity: Arc<Activity>,
 }
 
 pub struct Handle {
     node: Node,
     dir: DirBuffer,
+    /// Counted as open until cleanup (or close, if cleanup never came).
+    counted: AtomicBool,
 }
 
 fn status(s: NTSTATUS) -> FspError {
@@ -325,6 +368,14 @@ fn fill(info: &mut FileInfo, node: &Node) {
 }
 
 impl TarFs {
+    /// The handle's user is done with it: stop counting it as open.
+    fn release(&self, h: &Handle) {
+        if h.counted.swap(false, Ordering::Relaxed) {
+            self.activity.open.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.activity.touch();
+    }
+
     fn lookup(&self, name: &U16CStr) -> winfsp::Result<Node> {
         let path = name.to_string_lossy();
         self.vfs
@@ -374,6 +425,7 @@ impl FileSystemContext for TarFs {
         _granted_access: u32,
         file_info: &mut OpenFileInfo,
     ) -> winfsp::Result<Handle> {
+        self.activity.touch();
         let node = self.lookup(file_name)?;
         if create_options & FILE_DIRECTORY_FILE != 0 && !node.is_dir {
             return Err(status(STATUS_NOT_A_DIRECTORY));
@@ -382,13 +434,21 @@ impl FileSystemContext for TarFs {
             return Err(status(STATUS_FILE_IS_A_DIRECTORY));
         }
         fill(file_info.as_mut(), &node);
+        self.activity.open.fetch_add(1, Ordering::Relaxed);
         Ok(Handle {
             node,
             dir: DirBuffer::new(),
+            counted: AtomicBool::new(true),
         })
     }
 
-    fn close(&self, _context: Handle) {}
+    fn cleanup(&self, context: &Handle, _file_name: Option<&U16CStr>, _flags: u32) {
+        self.release(context);
+    }
+
+    fn close(&self, context: Handle) {
+        self.release(&context);
+    }
 
     fn get_file_info(&self, context: &Handle, file_info: &mut FileInfo) -> winfsp::Result<()> {
         fill(file_info, &context.node);
@@ -405,6 +465,7 @@ impl FileSystemContext for TarFs {
     }
 
     fn read(&self, context: &Handle, buffer: &mut [u8], offset: u64) -> winfsp::Result<u32> {
+        self.activity.touch();
         if offset >= context.node.size() {
             return Err(status(STATUS_END_OF_FILE));
         }
@@ -429,6 +490,7 @@ impl FileSystemContext for TarFs {
         marker: DirMarker,
         buffer: &mut [u8],
     ) -> winfsp::Result<u32> {
+        self.activity.touch();
         if !context.node.is_dir {
             return Err(status(STATUS_NOT_A_DIRECTORY));
         }
