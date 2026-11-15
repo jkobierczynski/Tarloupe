@@ -143,18 +143,24 @@ fn serve(
     mounted: &mut impl FnMut(&OsStr),
 ) -> Result<()> {
     let stop = &opts.stop;
-    let a = Archive::open(
+    let a = match Archive::open(
         path,
         &OpenOptions {
             progress: opts.progress.clone(),
+            cancel: Some(stop.clone()),
             ..Default::default()
         },
-    )
-    .with_context(|| format!("cannot open {}", path.display()))?;
+    ) {
+        Err(tarloupe_core::Error::Cancelled) => return Ok(()),
+        r => r.with_context(|| format!("cannot open {}", path.display()))?,
+    };
     if stop.load(Ordering::Relaxed) {
-        return Ok(()); // asked to stop while it was being indexed
+        return Ok(()); // asked to stop just as indexing finished
     }
     let m = tarloupe_winfsp::mount(Arc::new(a), None)?;
+    if stop.load(Ordering::Relaxed) {
+        return Ok(()); // asked to stop while waiting to mount
+    }
     let point = m.mount_point().to_os_string();
     if let Some(dir) = state.parent() {
         std::fs::create_dir_all(dir)?;

@@ -30,6 +30,9 @@ pub enum Error {
 
     #[error("{0}")]
     Unsupported(String),
+
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl Error {

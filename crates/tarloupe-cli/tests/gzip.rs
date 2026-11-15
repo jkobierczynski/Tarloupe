@@ -333,3 +333,41 @@ fn indexing_reports_progress_up_to_the_file_size() {
         assert!(seen.lock().unwrap().is_empty());
     }
 }
+
+#[test]
+fn cancelling_stops_indexing_and_leaves_no_index() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let tar = sample_tar();
+    let plain = dir.path().join("c.tar");
+    let gz = dir.path().join("c.tar.gz");
+    fs::write(&plain, &tar).unwrap();
+    fs::write(&gz, gzip(&tar, 6, None).unwrap()).unwrap();
+    for path in [&plain, &gz] {
+        let idx = dir
+            .path()
+            .join(format!("idx-{}", path.display().to_string().len()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        let opts = OpenOptions {
+            index_dir: Some(idx.clone()),
+            // Cancel as soon as indexing is under way.
+            progress: Some(Arc::new(move |done, _| {
+                if done > 0 {
+                    c.store(true, Ordering::Relaxed)
+                }
+            })),
+            cancel: Some(cancel),
+            ..Default::default()
+        };
+        match Archive::open(path, &opts) {
+            Err(tarloupe_core::Error::Cancelled) => {}
+            Err(e) => panic!("{}: {e}", path.display()),
+            Ok(_) => panic!("{}: not cancelled", path.display()),
+        }
+        let left = fs::read_dir(&idx).map_or(0, |d| d.count());
+        assert_eq!(left, 0, "{}: an index was left behind", path.display());
+        open(path, &idx, 1 << 20);
+    }
+}

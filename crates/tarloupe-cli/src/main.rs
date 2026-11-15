@@ -140,6 +140,7 @@ fn open(archive: &PathBuf, idx: &IndexOpts, rebuild: bool) -> Result<Archive> {
         require_index: false,
         checkpoint_spacing: idx.checkpoint_spacing,
         progress: None,
+        cancel: None,
     };
     let start = Instant::now();
     let a = Archive::open(archive, &opts)

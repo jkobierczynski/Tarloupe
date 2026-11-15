@@ -181,10 +181,12 @@ impl Agent {
     /// Browses `path` on a new thread, unless it is already being browsed.
     /// False if the agent is on its way out.
     fn start(&'static self, path: PathBuf) -> bool {
+        // Checked under the jobs lock, which quitting also takes, so a job
+        // is either refused here or stopped by the quit.
+        let mut jobs = self.jobs.lock().unwrap();
         if self.quitting.load(Ordering::Relaxed) {
             return false;
         }
-        let mut jobs = self.jobs.lock().unwrap();
         if let Some(j) = jobs.iter_mut().find(|j| j.path == path) {
             if j.stop.load(Ordering::Relaxed) {
                 j.again = true;
@@ -362,7 +364,10 @@ impl Agent {
 
     fn command(&self, cmd: usize) {
         if cmd == CMD_QUIT {
-            self.quitting.store(true, Ordering::Relaxed);
+            {
+                let _jobs = self.jobs.lock().unwrap();
+                self.quitting.store(true, Ordering::Relaxed);
+            }
             self.stop(None);
             return;
         }
