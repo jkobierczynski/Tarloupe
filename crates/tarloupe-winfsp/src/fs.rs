@@ -4,21 +4,24 @@ use std::sync::Arc;
 
 use tarloupe_core::vfs::{Node, Vfs};
 use tarloupe_core::{Archive, Error};
-use windows::core::{w, PCWSTR};
+use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
-    LocalFree, HLOCAL, NTSTATUS, STATUS_END_OF_FILE, STATUS_FILE_CORRUPT_ERROR,
-    STATUS_FILE_IS_A_DIRECTORY, STATUS_IO_DEVICE_ERROR, STATUS_NOT_A_DIRECTORY,
-    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_UNSUCCESSFUL,
+    CloseHandle, LocalFree, HANDLE, HLOCAL, NTSTATUS, STATUS_END_OF_FILE,
+    STATUS_FILE_CORRUPT_ERROR, STATUS_FILE_IS_A_DIRECTORY, STATUS_IO_DEVICE_ERROR,
+    STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_UNSUCCESSFUL,
 };
 use windows::Win32::Security::Authorization::{
-    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
-use windows::Win32::Security::PSECURITY_DESCRIPTOR;
+use windows::Win32::Security::{
+    GetTokenInformation, TokenUser, PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER,
+};
 use windows::Win32::Storage::FileSystem::{
     GetLogicalDrives, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY,
 };
 use windows::Win32::System::LibraryLoader::LoadLibraryW;
 use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
     VolumeInfo, WideNameInfo,
@@ -26,8 +29,9 @@ use winfsp::filesystem::{
 use winfsp::host::{FileSystemHost, VolumeParams};
 use winfsp::{FspError, FspInit, U16CStr};
 
-/// Read and execute for everyone; the volume is read-only anyway.
-const SDDL: PCWSTR = w!("O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;WD)");
+/// Read and execute (`FILE_GENERIC_READ | FILE_GENERIC_EXECUTE`). The
+/// volume is read-only, so nobody gets more.
+const READ_EXECUTE: &str = "0x1200a9";
 const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 /// Seconds between 1601-01-01 and 1970-01-01.
@@ -206,12 +210,51 @@ fn install_dir() -> Option<OsString> {
     None
 }
 
+/// The string SID of the user running this process.
+fn current_user_sid() -> Result<String, MountError> {
+    let err = |what: &str, e: windows::core::Error| MountError::WinFsp(format!("{what}: {e}"));
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .map_err(|e| err("cannot open the process token", e))?;
+        let mut len = 0u32;
+        // The first call only reports the size needed.
+        let _ = GetTokenInformation(token, TokenUser, None, 0, &mut len);
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        let res = GetTokenInformation(
+            token,
+            TokenUser,
+            Some(buf.as_mut_ptr().cast()),
+            len,
+            &mut len,
+        );
+        let _ = CloseHandle(token);
+        res.map_err(|e| err("cannot read the process user", e))?;
+        let user = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut s = PWSTR::null();
+        ConvertSidToStringSidW(user.User.Sid, &mut s)
+            .map_err(|e| err("cannot format the user SID", e))?;
+        let sid = s.to_string().unwrap_or_default();
+        let _ = LocalFree(Some(HLOCAL(s.0.cast())));
+        Ok(sid)
+    }
+}
+
+/// Every file and folder gets the same descriptor: owned by the user who
+/// mounted the archive, readable by that user, SYSTEM and Administrators
+/// only. Other local accounts get nothing, even on a folder mount they
+/// can reach, since they may not be allowed to read the archive itself.
 fn security_descriptor() -> Result<Vec<u8>, MountError> {
+    let sid = current_user_sid()?;
+    let sddl = format!(
+        "O:{sid}G:{sid}D:P(A;;{READ_EXECUTE};;;{sid})(A;;{READ_EXECUTE};;;SY)(A;;{READ_EXECUTE};;;BA)"
+    );
+    let sddl: Vec<u16> = sddl.encode_utf16().chain([0]).collect();
     let mut psd = PSECURITY_DESCRIPTOR::default();
     let mut len = 0u32;
     unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            SDDL,
+            PCWSTR(sddl.as_ptr()),
             SDDL_REVISION_1,
             &mut psd,
             Some(&mut len as *mut u32),

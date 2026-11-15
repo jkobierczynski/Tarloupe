@@ -26,8 +26,9 @@ use crate::error::{Error, Result};
 
 /// Longest name Windows accepts, in UTF-16 units.
 const MAX_NAME: usize = 255;
-/// Directory listings kept in memory.
-const DIR_CACHE: usize = 4096;
+/// Directory listings kept in memory, counted in entries so that a few huge
+/// folders cannot pull the whole index into memory.
+const DIR_CACHE_ENTRIES: usize = 200_000;
 
 /// A file or directory as the file system shows it.
 #[derive(Debug, Clone)]
@@ -87,6 +88,8 @@ pub struct Vfs {
 struct DirCache {
     map: HashMap<i64, (Arc<Listing>, u64)>,
     tick: u64,
+    /// Entries across all cached listings.
+    entries: usize,
 }
 
 impl Vfs {
@@ -143,24 +146,37 @@ impl Vfs {
         }
         let listing = Arc::new(self.build_listing(key)?);
         let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if c.map.len() >= DIR_CACHE {
-            if let Some(&old) = c.map.iter().min_by_key(|(_, (_, u))| *u).map(|(k, _)| k) {
-                c.map.remove(&old);
+        // Evict the least recently used listings until this one fits. A
+        // listing larger than the whole budget is returned but not kept.
+        let size = listing.entries.len().max(1);
+        if size > DIR_CACHE_ENTRIES {
+            return Ok(listing);
+        }
+        while c.entries + size > DIR_CACHE_ENTRIES {
+            let Some(&old) = c.map.iter().min_by_key(|(_, (_, u))| *u).map(|(k, _)| k) else {
+                break;
+            };
+            if let Some((l, _)) = c.map.remove(&old) {
+                c.entries -= l.entries.len().max(1);
             }
         }
         c.tick += 1;
         let t = c.tick;
-        c.map.insert(key, (listing.clone(), t));
+        if let Some((l, _)) = c.map.insert(key, (listing.clone(), t)) {
+            // Another thread built the same listing meanwhile.
+            c.entries -= l.entries.len().max(1);
+        }
+        c.entries += size;
         Ok(listing)
     }
 
     fn build_listing(&self, dir_id: i64) -> Result<Listing> {
         let mut out = Listing::default();
         for e in self.archive.index().children(dir_id)? {
-            let Some(node) = self.node_for(e.clone())? else {
+            let base = windows_name(e.name());
+            let Some(node) = self.node_for(e)? else {
                 continue;
             };
-            let base = windows_name(e.name());
             let mut name = base.clone();
             let mut n = 2;
             while out.by_fold.contains_key(&fold(&name)) {

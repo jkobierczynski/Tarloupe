@@ -142,6 +142,10 @@ pub fn build_tree(members: Vec<Entry>) -> Vec<Entry> {
 pub struct Index {
     pool: Mutex<Vec<Connection>>,
     path: PathBuf,
+    /// The `meta` table as first opened. A connection opened later must see
+    /// the same, so that every connection reads the same index file even if
+    /// the path is replaced (a rebuild renames a new file over it).
+    meta: Vec<(String, String)>,
 }
 
 /// A pooled connection, returned to the pool on drop.
@@ -275,9 +279,11 @@ impl Index {
 
     fn open_unchecked(path: &Path) -> Result<Index> {
         let conn = open_read_only(path)?;
+        let meta = read_meta(&conn)?;
         Ok(Index {
             pool: Mutex::new(vec![conn]),
             path: path.to_path_buf(),
+            meta,
         })
     }
 
@@ -285,7 +291,16 @@ impl Index {
         let pooled = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop();
         let conn = match pooled {
             Some(c) => c,
-            None => open_read_only(&self.path)?,
+            None => {
+                let c = open_read_only(&self.path)?;
+                if read_meta(&c)? != self.meta {
+                    return Err(Error::StaleIndex {
+                        path: self.path.display().to_string(),
+                        reason: "the index file was replaced while in use".into(),
+                    });
+                }
+                c
+            }
         };
         Ok(Conn {
             conn: Some(conn),
@@ -420,6 +435,12 @@ impl Index {
     }
 }
 
+fn read_meta(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut st = conn.prepare("SELECT key, value FROM meta ORDER BY key")?;
+    let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 fn open_read_only(path: &Path) -> Result<Connection> {
     Ok(Connection::open_with_flags(
         path,
@@ -477,4 +498,33 @@ fn row_to_entry(r: &Row<'_>) -> rusqlite::Result<Entry> {
         implicit: r.get(20)?,
         superseded: r.get(21)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pooled_connections_never_mix_index_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.tli");
+        let key = |size| ArchiveKey {
+            size,
+            mtime_ns: 1,
+            sample_hash: 2,
+        };
+        let idx = Index::create(&path, &key(10), Codec::None, &[], &[]).unwrap();
+        // Keep the only pooled connection busy, so the next query opens a
+        // new one, then replace the file as a rebuild for another archive
+        // would (where the platform allows replacing an open file).
+        let busy = idx.conn().unwrap();
+        drop(Index::create(&path, &key(20), Codec::None, &[], &[]));
+        match idx.meta("archive_size") {
+            Ok(v) => assert_eq!(v.as_deref(), Some("10")),
+            Err(Error::StaleIndex { .. }) => {}
+            Err(e) => panic!("{e}"),
+        }
+        drop(busy);
+        assert_eq!(idx.meta("archive_size").unwrap().as_deref(), Some("10"));
+    }
 }
