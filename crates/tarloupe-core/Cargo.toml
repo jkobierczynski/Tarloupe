@@ -1,0 +1,17 @@
+[package]
+name = "tarloupe-core"
+description = "Platform-neutral core of Tarloupe: tar walker, persistent seek index, and random-access reads"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+rusqlite.workspace = true
+xxhash-rust.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

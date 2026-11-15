@@ -1,0 +1,21 @@
+[package]
+name = "tarloupe-cli"
+description = "Command-line front end for Tarloupe"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "tarloupe"
+path = "src/main.rs"
+
+[dependencies]
+tarloupe-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tarloupe-corpus = { path = "../tarloupe-corpus" }

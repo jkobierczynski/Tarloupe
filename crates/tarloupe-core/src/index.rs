@@ -1,0 +1,330 @@
+//! Persistent SQLite index (`.tli`).
+//!
+//! Schema version 1:
+//! - `meta`: format version, codec, archive key, counts.
+//! - `entries`: one row per member in archive order, plus synthesised
+//!   parent directories. Lookups ignore superseded rows (last one wins).
+//! - `checkpoints`: decoder restart points for compressed streams; created
+//!   now and filled from M1 (gzip) on.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
+
+use crate::codec::Codec;
+use crate::entry::{decode_sparse, encode_sparse, Entry, EntryKind};
+use crate::error::{Error, Result};
+use crate::key::ArchiveKey;
+use crate::path::parent;
+
+pub const FORMAT_VERSION: i64 = 1;
+
+const SCHEMA: &str = "
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE entries (
+    id            INTEGER PRIMARY KEY,
+    parent_id     INTEGER NOT NULL,
+    path          BLOB NOT NULL,
+    name          BLOB NOT NULL,
+    raw_name      BLOB NOT NULL,
+    typeflag      INTEGER NOT NULL,
+    kind          INTEGER NOT NULL,
+    mode          INTEGER NOT NULL,
+    uid           INTEGER NOT NULL,
+    gid           INTEGER NOT NULL,
+    uname         BLOB NOT NULL,
+    gname         BLOB NOT NULL,
+    mtime         INTEGER NOT NULL,
+    size          INTEGER NOT NULL,
+    link_target   BLOB NOT NULL,
+    dev_major     INTEGER NOT NULL,
+    dev_minor     INTEGER NOT NULL,
+    header_offset INTEGER NOT NULL,
+    data_offset   INTEGER NOT NULL,
+    stored_size   INTEGER NOT NULL,
+    sparse        BLOB,
+    implicit      INTEGER NOT NULL,
+    superseded    INTEGER NOT NULL
+);
+CREATE TABLE checkpoints (
+    uncompressed_offset   INTEGER PRIMARY KEY,
+    compressed_bit_offset INTEGER NOT NULL,
+    state                 BLOB
+);
+";
+
+const INDEXES: &str = "
+CREATE INDEX entries_by_parent ON entries (parent_id, name) WHERE superseded = 0;
+CREATE INDEX entries_by_path ON entries (path) WHERE superseded = 0;
+";
+
+const COLUMNS: &str = "id, parent_id, path, raw_name, typeflag, kind, mode, uid, gid, uname, gname, mtime, \
+     size, link_target, dev_major, dev_minor, header_offset, data_offset, stored_size, sparse, implicit, superseded";
+
+/// Default directory for index files: `%LOCALAPPDATA%\Tarloupe\index` on
+/// Windows, `~/.local/share/Tarloupe/index` on Linux. `TARLOUPE_INDEX_DIR`
+/// overrides it.
+pub fn default_index_dir() -> PathBuf {
+    if let Some(d) = std::env::var_os("TARLOUPE_INDEX_DIR") {
+        return PathBuf::from(d);
+    }
+    dirs::data_local_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("Tarloupe")
+        .join("index")
+}
+
+/// Assigns ids, synthesises missing parent directories, links parents and
+/// marks members replaced by a later member with the same path.
+pub fn build_tree(members: Vec<Entry>) -> Vec<Entry> {
+    let mut out: Vec<Entry> = Vec::with_capacity(members.len());
+    let mut latest: HashMap<Vec<u8>, usize> = HashMap::with_capacity(members.len());
+    for e in members {
+        // Make sure every ancestor exists.
+        let mut missing: Vec<Vec<u8>> = Vec::new();
+        let mut p = parent(&e.path);
+        while !p.is_empty() && !latest.contains_key(p) {
+            missing.push(p.to_vec());
+            p = parent(p);
+        }
+        for dir in missing.into_iter().rev() {
+            latest.insert(dir.clone(), out.len());
+            out.push(Entry {
+                id: 0,
+                parent_id: 0,
+                path: dir,
+                raw_name: Vec::new(),
+                typeflag: crate::header::DIRTYPE,
+                kind: EntryKind::Dir,
+                mode: 0o755,
+                uid: 0,
+                gid: 0,
+                uname: Vec::new(),
+                gname: Vec::new(),
+                mtime: e.mtime,
+                size: 0,
+                link_target: Vec::new(),
+                dev_major: 0,
+                dev_minor: 0,
+                header_offset: e.header_offset,
+                data_offset: e.header_offset,
+                stored_size: 0,
+                sparse: None,
+                implicit: true,
+                superseded: false,
+            });
+        }
+        if let Some(prev) = latest.insert(e.path.clone(), out.len()) {
+            out[prev].superseded = true;
+        }
+        out.push(e);
+    }
+    for (i, e) in out.iter_mut().enumerate() {
+        e.id = i as i64 + 1;
+        let p = parent(&e.path);
+        e.parent_id = if e.path.is_empty() || p.is_empty() {
+            0
+        } else {
+            latest.get(p).map(|&j| j as i64 + 1).unwrap_or(0)
+        };
+    }
+    out
+}
+
+pub struct Index {
+    conn: Connection,
+    path: PathBuf,
+}
+
+impl Index {
+    /// Writes a new index atomically (temp file + rename).
+    pub fn create(path: &Path, key: &ArchiveKey, codec: Codec, entries: &[Entry]) -> Result<Index> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let tmp = path.with_extension(format!("tli.tmp-{}", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        {
+            let mut conn = Connection::open(&tmp)?;
+            conn.execute_batch(
+                "PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; PRAGMA page_size = 8192;",
+            )?;
+            conn.execute_batch(SCHEMA)?;
+            let tx = conn.transaction()?;
+            {
+                let mut meta = tx.prepare("INSERT INTO meta (key, value) VALUES (?1, ?2)")?;
+                let members = entries.iter().filter(|e| !e.implicit).count();
+                for (k, v) in [
+                    ("format_version", FORMAT_VERSION.to_string()),
+                    ("tool_version", env!("CARGO_PKG_VERSION").to_string()),
+                    ("codec", codec.name().to_string()),
+                    ("archive_size", key.size.to_string()),
+                    ("archive_mtime_ns", key.mtime_ns.to_string()),
+                    ("archive_sample_hash", format!("{:016x}", key.sample_hash)),
+                    ("archive_key", key.id()),
+                    ("entry_count", entries.len().to_string()),
+                    ("member_count", members.to_string()),
+                ] {
+                    meta.execute(params![k, v])?;
+                }
+                let mut ins = tx.prepare(&format!(
+                    "INSERT INTO entries (id, parent_id, path, name, raw_name, typeflag, kind, mode, uid, gid, \
+                     uname, gname, mtime, size, link_target, dev_major, dev_minor, header_offset, data_offset, \
+                     stored_size, sparse, implicit, superseded) VALUES ({})",
+                    (1..=23).map(|i| format!("?{i}")).collect::<Vec<_>>().join(",")
+                ))?;
+                for e in entries {
+                    ins.execute(params![
+                        e.id,
+                        e.parent_id,
+                        e.path,
+                        e.name(),
+                        e.raw_name,
+                        e.typeflag as i64,
+                        e.kind.to_code(),
+                        e.mode as i64,
+                        e.uid as i64,
+                        e.gid as i64,
+                        e.uname,
+                        e.gname,
+                        e.mtime,
+                        e.size as i64,
+                        e.link_target,
+                        e.dev_major as i64,
+                        e.dev_minor as i64,
+                        e.header_offset as i64,
+                        e.data_offset as i64,
+                        e.stored_size as i64,
+                        e.sparse.as_deref().map(encode_sparse),
+                        e.implicit,
+                        e.superseded,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+            conn.execute_batch(INDEXES)?;
+            conn.execute_batch("ANALYZE;")?;
+        }
+        std::fs::rename(&tmp, path)?;
+        Index::open_unchecked(path)
+    }
+
+    fn open_unchecked(path: &Path) -> Result<Index> {
+        let conn = Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(Index {
+            conn,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Opens an index and checks that it belongs to the archive described by `key`.
+    pub fn open(path: &Path, key: &ArchiveKey) -> Result<Index> {
+        let idx = Index::open_unchecked(path)?;
+        let stale = |reason: String| Error::StaleIndex {
+            path: path.display().to_string(),
+            reason,
+        };
+        let version: i64 = idx
+            .meta("format_version")?
+            .and_then(|v| v.parse().ok())
+            .ok_or_else(|| stale("missing format version".into()))?;
+        if version != FORMAT_VERSION {
+            return Err(stale(format!(
+                "format version {version}, expected {FORMAT_VERSION}"
+            )));
+        }
+        let size = idx.meta("archive_size")?.unwrap_or_default();
+        let hash = idx.meta("archive_sample_hash")?.unwrap_or_default();
+        if size != key.size.to_string() || hash != format!("{:016x}", key.sample_hash) {
+            return Err(stale("the archive has changed since it was indexed".into()));
+        }
+        Ok(idx)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
+            .optional()?)
+    }
+
+    /// Visits every archive member (not synthesised directories) in archive order.
+    pub fn for_each_member(&self, mut f: impl FnMut(Entry) -> Result<()>) -> Result<()> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM entries WHERE implicit = 0 ORDER BY id"
+        ))?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            f(row_to_entry(r)?)?;
+        }
+        Ok(())
+    }
+
+    pub fn get(&self, id: i64) -> Result<Option<Entry>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM entries WHERE id = ?1"),
+                [id],
+                row_to_entry,
+            )
+            .optional()?)
+    }
+
+    /// Current (non-superseded) entry for a normalised path.
+    pub fn lookup(&self, path: &[u8]) -> Result<Option<Entry>> {
+        Ok(self
+            .conn
+            .query_row(
+                &format!("SELECT {COLUMNS} FROM entries WHERE path = ?1 AND superseded = 0 ORDER BY id DESC LIMIT 1"),
+                [path],
+                row_to_entry,
+            )
+            .optional()?)
+    }
+
+    /// Current children of a directory (0 = archive root), sorted by name.
+    pub fn children(&self, dir_id: i64) -> Result<Vec<Entry>> {
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT {COLUMNS} FROM entries WHERE parent_id = ?1 AND superseded = 0 AND path <> x'' ORDER BY name"
+        ))?;
+        let rows = stmt.query_map([dir_id], row_to_entry)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+}
+
+fn row_to_entry(r: &Row<'_>) -> rusqlite::Result<Entry> {
+    let sparse: Option<Vec<u8>> = r.get(19)?;
+    Ok(Entry {
+        id: r.get(0)?,
+        parent_id: r.get(1)?,
+        path: r.get(2)?,
+        raw_name: r.get(3)?,
+        typeflag: r.get::<_, i64>(4)? as u8,
+        kind: EntryKind::from_code(r.get(5)?),
+        mode: r.get::<_, i64>(6)? as u32,
+        uid: r.get::<_, i64>(7)? as u64,
+        gid: r.get::<_, i64>(8)? as u64,
+        uname: r.get(9)?,
+        gname: r.get(10)?,
+        mtime: r.get(11)?,
+        size: r.get::<_, i64>(12)? as u64,
+        link_target: r.get(13)?,
+        dev_major: r.get::<_, i64>(14)? as u64,
+        dev_minor: r.get::<_, i64>(15)? as u64,
+        header_offset: r.get::<_, i64>(16)? as u64,
+        data_offset: r.get::<_, i64>(17)? as u64,
+        stored_size: r.get::<_, i64>(18)? as u64,
+        sparse: sparse.map(|b| decode_sparse(&b)),
+        implicit: r.get(20)?,
+        superseded: r.get(21)?,
+    })
+}
