@@ -1,6 +1,6 @@
 //! Persistent SQLite index (`.tli`).
 //!
-//! Schema version 1:
+//! Schema version 2:
 //! - `meta`: format version, codec, archive key, counts.
 //! - `entries`: one row per member in archive order, plus synthesised
 //!   parent directories. Lookups ignore superseded rows (last one wins).
@@ -18,7 +18,7 @@ use crate::error::{Error, Result};
 use crate::key::ArchiveKey;
 use crate::path::parent;
 
-pub const FORMAT_VERSION: i64 = 1;
+pub const FORMAT_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -57,6 +57,7 @@ CREATE TABLE checkpoints (
 const INDEXES: &str = "
 CREATE INDEX entries_by_parent ON entries (parent_id, name) WHERE superseded = 0;
 CREATE INDEX entries_by_path ON entries (path) WHERE superseded = 0;
+CREATE INDEX entries_by_path_history ON entries (path, id) WHERE implicit = 0;
 ";
 
 const COLUMNS: &str = "id, parent_id, path, raw_name, typeflag, kind, mode, uid, gid, uname, gname, mtime, \
@@ -150,7 +151,8 @@ impl Index {
             let _ = std::fs::remove_file(&tmp);
         }
         result?;
-        Index::open_unchecked(path)
+        // Validate: a concurrent build may have replaced a shared index path.
+        Index::open(path, key)
     }
 
     fn write(tmp: &Path, key: &ArchiveKey, codec: Codec, entries: &[Entry]) -> Result<()> {
