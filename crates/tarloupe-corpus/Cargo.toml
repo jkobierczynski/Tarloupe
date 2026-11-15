@@ -1,0 +1,20 @@
+[package]
+name = "tarloupe-corpus"
+description = "Deterministic synthetic tar corpus generator for Tarloupe tests and benchmarks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tarloupe-corpus"
+path = "src/main.rs"
