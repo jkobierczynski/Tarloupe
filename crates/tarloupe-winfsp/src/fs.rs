@@ -147,10 +147,13 @@ fn free_drive() -> Option<OsString> {
         .map(|l| OsString::from(format!("{}:", l as char)))
 }
 
-/// Loads WinFsp's DLL from its install folder (it is not on `PATH`), then
-/// lets the winfsp crate finish initialising.
+/// Loads WinFsp's DLL by full path from the install folder named in the
+/// registry, then lets the winfsp crate finish initialising (it finds the
+/// loaded module by name). Without that, nothing is loaded: a bare-name
+/// load would search the current folder and could run a planted DLL.
 fn load_winfsp() -> Result<FspInit, MountError> {
-    if let Some(dir) = install_dir() {
+    let dir = install_dir().ok_or(MountError::WinFspMissing)?;
+    {
         let dll = if cfg!(target_arch = "aarch64") {
             "winfsp-a64.dll"
         } else if cfg!(target_arch = "x86") {
@@ -163,7 +166,7 @@ fn load_winfsp() -> Result<FspInit, MountError> {
         path.extend(dll.encode_utf16());
         path.push(0);
         // Once loaded, the delay-load stubs find the module by name.
-        let _ = unsafe { LoadLibraryW(PCWSTR(path.as_ptr())) };
+        unsafe { LoadLibraryW(PCWSTR(path.as_ptr())) }.map_err(|_| MountError::WinFspMissing)?;
     }
     winfsp::winfsp_init().map_err(|_| MountError::WinFspMissing)
 }

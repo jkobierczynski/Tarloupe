@@ -17,7 +17,7 @@
 //!   symlinks that dangle or leave the archive are hidden, as are devices
 //!   and FIFOs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use crate::archive::Archive;
@@ -86,10 +86,59 @@ pub struct Vfs {
 
 #[derive(Default)]
 struct DirCache {
+    /// Directory id -> listing and when it was last used.
     map: HashMap<i64, (Arc<Listing>, u64)>,
+    /// Last use -> directory id, oldest first, for eviction.
+    order: BTreeMap<u64, i64>,
     tick: u64,
     /// Entries across all cached listings.
     entries: usize,
+}
+
+impl DirCache {
+    fn get(&mut self, key: i64) -> Option<Arc<Listing>> {
+        self.tick += 1;
+        let t = self.tick;
+        let (l, used) = self.map.get_mut(&key)?;
+        self.order.remove(used);
+        *used = t;
+        self.order.insert(t, key);
+        Some(l.clone())
+    }
+
+    fn remove(&mut self, key: i64) {
+        if let Some((l, used)) = self.map.remove(&key) {
+            self.order.remove(&used);
+            self.entries -= cost(&l);
+        }
+    }
+
+    /// Keeps `l`, evicting the least recently used listings until it fits.
+    /// A listing larger than the whole budget is not kept.
+    fn insert(&mut self, key: i64, l: Arc<Listing>) {
+        self.remove(key); // another thread may have built it meanwhile
+        let size = cost(&l);
+        if size > DIR_CACHE_ENTRIES {
+            return;
+        }
+        while self.entries + size > DIR_CACHE_ENTRIES {
+            let Some((_, old)) = self.order.pop_first() else {
+                break;
+            };
+            if let Some((l, _)) = self.map.remove(&old) {
+                self.entries -= cost(&l);
+            }
+        }
+        self.tick += 1;
+        self.order.insert(self.tick, key);
+        self.map.insert(key, (l, self.tick));
+        self.entries += size;
+    }
+}
+
+/// What a listing counts against the cache budget.
+fn cost(l: &Listing) -> usize {
+    l.entries.len().max(1)
 }
 
 impl Vfs {
@@ -135,53 +184,42 @@ impl Vfs {
     /// The children of a directory node.
     pub fn list(&self, dir: &Node) -> Result<Arc<Listing>> {
         let key = dir.dir_id();
+        if let Some(l) = self
+            .cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(key)
         {
-            let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-            c.tick += 1;
-            let t = c.tick;
-            if let Some((l, used)) = c.map.get_mut(&key) {
-                *used = t;
-                return Ok(l.clone());
-            }
+            return Ok(l);
         }
         let listing = Arc::new(self.build_listing(key)?);
-        let mut c = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        // Evict the least recently used listings until this one fits. A
-        // listing larger than the whole budget is returned but not kept.
-        let size = listing.entries.len().max(1);
-        if size > DIR_CACHE_ENTRIES {
-            return Ok(listing);
-        }
-        while c.entries + size > DIR_CACHE_ENTRIES {
-            let Some(&old) = c.map.iter().min_by_key(|(_, (_, u))| *u).map(|(k, _)| k) else {
-                break;
-            };
-            if let Some((l, _)) = c.map.remove(&old) {
-                c.entries -= l.entries.len().max(1);
-            }
-        }
-        c.tick += 1;
-        let t = c.tick;
-        if let Some((l, _)) = c.map.insert(key, (listing.clone(), t)) {
-            // Another thread built the same listing meanwhile.
-            c.entries -= l.entries.len().max(1);
-        }
-        c.entries += size;
+        self.cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, listing.clone());
         Ok(listing)
     }
 
     fn build_listing(&self, dir_id: i64) -> Result<Listing> {
         let mut out = Listing::default();
+        // Next suffix to try for each folded base name, so that many names
+        // differing only in case do not probe from ` (2)` every time.
+        let mut next: HashMap<String, usize> = HashMap::new();
         for e in self.archive.index().children(dir_id)? {
             let base = windows_name(e.name());
             let Some(node) = self.node_for(e)? else {
                 continue;
             };
             let mut name = base.clone();
-            let mut n = 2;
-            while out.by_fold.contains_key(&fold(&name)) {
-                name = with_suffix(&base, n);
-                n += 1;
+            if out.by_fold.contains_key(&fold(&name)) {
+                let n = next.entry(fold(&base)).or_insert(2);
+                loop {
+                    name = with_suffix(&base, *n);
+                    *n += 1;
+                    if !out.by_fold.contains_key(&fold(&name)) {
+                        break;
+                    }
+                }
             }
             out.by_fold.insert(fold(&name), out.entries.len());
             out.entries.push((name, node));
@@ -359,6 +397,38 @@ fn with_suffix(name: &str, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn listing(n: usize) -> Arc<Listing> {
+        let node = Node {
+            entry: root_entry(),
+            is_dir: true,
+        };
+        Arc::new(Listing {
+            entries: (0..n).map(|i| (i.to_string(), node.clone())).collect(),
+            by_fold: HashMap::new(),
+        })
+    }
+
+    #[test]
+    fn dir_cache_evicts_least_recently_used_by_entries() {
+        let mut c = DirCache::default();
+        let big = DIR_CACHE_ENTRIES / 4;
+        for k in 0..4 {
+            c.insert(k, listing(big));
+        }
+        assert!(c.get(0).is_some()); // 1 is now the oldest
+        c.insert(9, listing(big));
+        assert!(c.get(1).is_none());
+        assert!(c.get(0).is_some() && c.get(2).is_some() && c.get(9).is_some());
+        assert_eq!(c.entries, 4 * big);
+        // Too large to keep, and evicts nothing.
+        c.insert(10, listing(DIR_CACHE_ENTRIES + 1));
+        assert!(c.get(10).is_none());
+        assert_eq!(c.entries, 4 * big);
+        // Replacing a listing does not count it twice.
+        c.insert(9, listing(big));
+        assert_eq!((c.entries, c.map.len(), c.order.len()), (4 * big, 4, 4));
+    }
 
     #[test]
     fn names() {

@@ -222,6 +222,15 @@ impl Index {
                     ("entry_count", entries.len().to_string()),
                     ("member_count", members.to_string()),
                     ("checkpoint_count", checkpoints.len().to_string()),
+                    // Unique per build (the temp file was created
+                    // exclusively), so two builds never look the same.
+                    (
+                        "generation",
+                        tmp.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
                 ] {
                     meta.execute(params![k, v])?;
                 }
@@ -517,14 +526,19 @@ mod tests {
         // Keep the only pooled connection busy, so the next query opens a
         // new one, then replace the file as a rebuild for another archive
         // would (where the platform allows replacing an open file).
-        let busy = idx.conn().unwrap();
-        drop(Index::create(&path, &key(20), Codec::None, &[], &[]));
-        match idx.meta("archive_size") {
-            Ok(v) => assert_eq!(v.as_deref(), Some("10")),
-            Err(Error::StaleIndex { .. }) => {}
-            Err(e) => panic!("{e}"),
+        let generation = idx.meta("generation").unwrap().unwrap();
+        // Another archive, then the same archive again (equal metadata, but
+        // its checkpoints could differ): neither may be mixed in.
+        for size in [20, 10] {
+            let busy = idx.conn().unwrap();
+            drop(Index::create(&path, &key(size), Codec::None, &[], &[]));
+            match idx.meta("generation") {
+                Ok(v) => assert_eq!(v.as_ref(), Some(&generation)),
+                Err(Error::StaleIndex { .. }) => {}
+                Err(e) => panic!("{e}"),
+            }
+            drop(busy);
+            assert_eq!(idx.meta("generation").unwrap(), Some(generation.clone()));
         }
-        drop(busy);
-        assert_eq!(idx.meta("archive_size").unwrap().as_deref(), Some("10"));
     }
 }

@@ -317,6 +317,12 @@ fn run(cli: Cli) -> Result<()> {
             mount_point,
             idx,
         } => {
+            // Say so before spending time on indexing.
+            if !cfg!(windows) {
+                anyhow::bail!(
+                    "mount is only available on Windows (with WinFsp); use ls, cat or extract"
+                );
+            }
             let a = open(&archive, &idx, false)?;
             mount(a, mount_point)?;
         }
@@ -345,7 +351,7 @@ fn mount(a: Archive, point: Option<OsString>) -> Result<()> {
 
 #[cfg(not(windows))]
 fn mount(_a: Archive, _point: Option<OsString>) -> Result<()> {
-    anyhow::bail!("mount is only available on Windows (with WinFsp); use ls, cat or extract")
+    unreachable!("checked before opening the archive")
 }
 
 fn main() -> ExitCode {
