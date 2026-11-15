@@ -380,6 +380,19 @@ fn index_safety() {
     assert!(Archive::open(&path, &opts).is_err());
     assert_eq!(fs::read(&path).unwrap(), before);
 
+    // ... nor when the cache name derived from its key is the archive.
+    let id = tarloupe_core::key::ArchiveKey::compute(&path).unwrap().id();
+    let keyed = dir.path().join(format!("{id}.tli"));
+    fs::rename(&path, &keyed).unwrap();
+    let opts = OpenOptions {
+        index_dir: Some(dir.path().to_path_buf()),
+        rebuild: true,
+        ..Default::default()
+    };
+    assert!(Archive::open(&keyed, &opts).is_err());
+    assert_eq!(fs::read(&keyed).unwrap(), before);
+    fs::rename(&keyed, &path).unwrap();
+
     // A corrupt index is not silently rebuilt when one is required.
     let sidecar = dir.path().join("a.tar.tli");
     fs::write(&sidecar, b"not a database").unwrap();

@@ -59,21 +59,20 @@ impl Archive {
         // describe the same file even if the path is replaced meanwhile.
         let key = ArchiveKey::from_file(&file)?;
         let index_path = match &opts.index_path {
-            Some(p) => {
-                if same_file(&path, p) {
-                    return Err(Error::Unsupported(format!(
-                        "the index path {} is the archive itself",
-                        p.display()
-                    )));
-                }
-                p.clone()
-            }
+            Some(p) => p.clone(),
             None => opts
                 .index_dir
                 .clone()
                 .unwrap_or_else(default_index_dir)
                 .join(format!("{}.tli", key.id())),
         };
+        // Building replaces the index file, so it must never be the archive.
+        if same_file(&path, &index_path) {
+            return Err(Error::Unsupported(format!(
+                "the index path {} is the archive itself",
+                index_path.display()
+            )));
+        }
 
         let (index, status) = if !opts.rebuild && index_path.exists() {
             match Index::open(&index_path, &key) {
