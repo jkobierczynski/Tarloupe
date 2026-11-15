@@ -13,8 +13,21 @@ export TARLOUPE_INDEX_DIR="$work/idx"
 gz="$work/bench-$size.tar.gz"
 TIMEFORMAT=%R
 
-t() { # prints wall seconds of a command
-  { time "$@" >/dev/null 2>&1; } 2>&1 | tail -1
+t() { # prints wall seconds of a command; fails (with its stderr) if it fails
+  local out
+  if ! out=$( { time "$@" >/dev/null 2>"$work/stderr"; } 2>&1 ); then
+    echo "benchmark command failed: $*" >&2
+    cat "$work/stderr" >&2
+    return 1
+  fi
+  printf '%s\n' "$out" | tail -1
+}
+
+row() { # row LABEL COMMAND...
+  local label=$1 secs
+  shift
+  secs=$(t "$@")
+  echo "| $label | $secs |"
 }
 
 if [ ! -f "$gz" ]; then
@@ -27,9 +40,9 @@ rm -rf "$TARLOUPE_INDEX_DIR"
 
 echo "| Step | Time (s) |"
 echo "|---|---|"
-echo "| gzip -dc (decompress everything, baseline) | $(t gzip -dc "$gz") |"
-echo "| tarloupe index (first open, one pass) | $(t "$bin/tarloupe" index "$gz") |"
-echo "| tarloupe ls (reopen with index) | $(t "$bin/tarloupe" ls "$gz") |"
+row "gzip -dc (decompress everything, baseline)" gzip -dc "$gz"
+row "tarloupe index (first open, one pass)" "$bin/tarloupe" index "$gz"
+row "tarloupe ls (reopen with index)" "$bin/tarloupe" ls "$gz"
 
 # The last member is the worst case for tools that read sequentially, and
 # a ~10 MB member in the middle is the plan's random-read target.
@@ -39,9 +52,9 @@ mids=$(printf '%s\n' "$listing" | awk '$1 ~ /^-/ && $3 > 5000000 && $3 < 2000000
 mid=$(printf '%s\n' "$mids" | sed -n "$(( ($(printf '%s\n' "$mids" | wc -l) + 1) / 2 ))p")
 for member in "$last" "$mid"; do
   bytes=$("$bin/tarloupe" cat "$gz" "$member" | wc -c)
-  echo "| **$member** ($bytes bytes): tarloupe cat | $(t "$bin/tarloupe" cat "$gz" "$member") |"
-  echo "| same file: GNU tar -xzO --occurrence | $(t tar -xzOf "$gz" --occurrence=1 "$member") |"
-  echo "| same file: 7-Zip (7z x gz, then tar) | $(t sh -c "7z x -so '$gz' | 7z x -si -ttar -so '$member'") |"
+  row "**$member** ($bytes bytes): tarloupe cat" "$bin/tarloupe" cat "$gz" "$member"
+  row "same file: GNU tar -xzO --occurrence" tar -xzOf "$gz" --occurrence=1 "$member"
+  row "same file: 7-Zip (7z x gz, then tar)" sh -c "7z x -so '$gz' | 7z x -si -ttar -so '$member'"
 done
 du -h "$TARLOUPE_INDEX_DIR"/*.tli | awk '{print "| index size | " $1 " |"}'
 ls -lh "$gz" | awk '{print "| archive size | " $5 " |"}'

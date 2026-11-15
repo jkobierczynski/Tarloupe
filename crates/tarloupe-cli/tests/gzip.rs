@@ -58,14 +58,9 @@ fn assert_same(plain: &Archive, gz: &Archive, seed: u64) {
         .filter(|e| e.kind == EntryKind::File && !e.superseded)
         .cloned()
         .collect();
-    for e in &files {
-        let (mut a, mut b) = (Vec::new(), Vec::new());
-        plain.copy_to(e, &mut a).unwrap();
-        gz.copy_to(e, &mut b).unwrap();
-        assert!(a == b, "contents of {} differ", e.display_path());
-    }
-    // Random reads, in random order, to exercise the cache and the
-    // decoder pool (including reads that go backwards).
+    // Random reads first, while the cache is cold, in random order to
+    // exercise checkpoint restarts and the decoder pool (including reads
+    // that go backwards). Then every file in full.
     let mut rng = Rng::new(seed);
     let big: Vec<&Entry> = files.iter().filter(|e| e.size > 0).collect();
     for _ in 0..1500 {
@@ -77,6 +72,12 @@ fn assert_same(plain: &Archive, gz: &Archive, seed: u64) {
         let nb = gz.read_at(e, off, &mut b).unwrap();
         assert_eq!(na, nb);
         assert!(a[..na] == b[..nb], "{} @ {off}+{len}", e.display_path());
+    }
+    for e in &files {
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        plain.copy_to(e, &mut a).unwrap();
+        gz.copy_to(e, &mut b).unwrap();
+        assert!(a == b, "contents of {} differ", e.display_path());
     }
 }
 
@@ -193,6 +194,46 @@ fn damaged_gzip_is_an_error() {
     let corrupt = dir.path().join("c.tar.gz");
     fs::write(&corrupt, &bad).unwrap();
     assert!(Archive::open(&corrupt, &opts).is_err());
+}
+
+#[test]
+fn damage_after_the_tar_end_is_an_error() {
+    // A small tar padded with zeros: the tar terminator comes long before
+    // the end of the gzip data, so only decoding to the end finds damage.
+    let dir = tempfile::tempdir().unwrap();
+    let mut tar = Vec::new();
+    write_edge(&mut tar, Format::Gnu).unwrap();
+    tar.extend(vec![0u8; 128 << 10]);
+    let opts = OpenOptions {
+        index_dir: Some(dir.path().join("idx")),
+        ..Default::default()
+    };
+    let good = gzip(&tar, 0, None).unwrap();
+    let mut no_trailer = good.clone();
+    no_trailer.truncate(good.len() - 8);
+    let mut bad_crc = good.clone();
+    let n = bad_crc.len();
+    bad_crc[n - 8] ^= 1;
+    // Two members; the second one's deflate data is damaged.
+    let half = tar.len() / 2;
+    let mut later = gzip(&tar[..half], 6, None).unwrap();
+    let second_start = later.len();
+    later.extend(gzip(&tar[half..], 6, None).unwrap());
+    let k = second_start + 20;
+    for b in &mut later[k..k + 16] {
+        *b ^= 0xff;
+    }
+    fs::write(dir.path().join("good.tar.gz"), &good).unwrap();
+    assert!(Archive::open(dir.path().join("good.tar.gz"), &opts).is_ok());
+    for (name, data) in [
+        ("no-trailer", no_trailer),
+        ("bad-crc", bad_crc),
+        ("later", later),
+    ] {
+        let path = dir.path().join(format!("{name}.tar.gz"));
+        fs::write(&path, data).unwrap();
+        assert!(Archive::open(&path, &opts).is_err(), "{name} must fail");
+    }
 }
 
 #[test]

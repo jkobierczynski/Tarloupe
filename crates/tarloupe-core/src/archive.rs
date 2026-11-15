@@ -364,6 +364,9 @@ fn build_index(
         Codec::Gzip => {
             let mut reader = IndexingReader::new(file.clone(), spacing)?;
             let members = Walker::new(ReadSource::new(&mut reader)).collect::<Result<Vec<_>>>()?;
+            // The walker stops at the tar terminator; decode the rest so a
+            // damaged tail or a bad trailer CRC fails here, not later.
+            std::io::copy(&mut reader, &mut std::io::sink())?;
             (members, std::mem::take(&mut reader.checkpoints))
         }
         _ => {

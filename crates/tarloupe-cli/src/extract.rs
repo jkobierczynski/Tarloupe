@@ -42,12 +42,15 @@ pub fn one(a: &Archive, e: &Entry, dest: &Path) -> Result<Option<Vec<Entry>>> {
             a.copy_to(e, &mut w)?;
             w.flush()?;
             let f = w.into_inner().map_err(|e| e.into_error())?;
+            // Times the platform cannot represent are left unset.
             let mtime = if e.mtime >= 0 {
-                SystemTime::UNIX_EPOCH + Duration::from_secs(e.mtime as u64)
+                SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(e.mtime as u64))
             } else {
-                SystemTime::UNIX_EPOCH - Duration::from_secs(e.mtime.unsigned_abs())
+                SystemTime::UNIX_EPOCH.checked_sub(Duration::from_secs(e.mtime.unsigned_abs()))
             };
-            let _ = f.set_modified(mtime);
+            if let Some(t) = mtime {
+                let _ = f.set_modified(t);
+            }
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
