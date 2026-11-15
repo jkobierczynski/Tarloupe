@@ -92,6 +92,16 @@ enum Cmd {
         #[command(flatten)]
         idx: IndexOpts,
     },
+    /// Show the archive as a read-only folder or drive (Windows, needs WinFsp).
+    /// Runs until Ctrl+C, then unmounts.
+    Mount {
+        archive: PathBuf,
+        /// Where to mount: a free drive letter such as `T:`, or a folder path
+        /// that does not exist yet (default: the last free drive letter).
+        mount_point: Option<OsString>,
+        #[command(flatten)]
+        idx: IndexOpts,
+    },
 }
 
 fn open(archive: &PathBuf, idx: &IndexOpts, rebuild: bool) -> Result<Archive> {
@@ -302,9 +312,46 @@ fn run(cli: Cli) -> Result<()> {
                     .with_context(|| format!("{name}: cannot read"))?;
             }
         }
+        Cmd::Mount {
+            archive,
+            mount_point,
+            idx,
+        } => {
+            // Say so before spending time on indexing.
+            if !cfg!(windows) {
+                anyhow::bail!(
+                    "mount is only available on Windows (with WinFsp); use ls, cat or extract"
+                );
+            }
+            let a = open(&archive, &idx, false)?;
+            mount(a, mount_point)?;
+        }
     }
     out.flush()?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn mount(a: Archive, point: Option<OsString>) -> Result<()> {
+    use std::sync::{mpsc, Arc};
+    let (tx, rx) = mpsc::channel();
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })
+    .context("cannot install the Ctrl+C handler")?;
+    let m = tarloupe_winfsp::mount(Arc::new(a), point.as_deref())?;
+    // Scripts (and the tests) wait for this line before using the mount.
+    println!("{}", m.mount_point().to_string_lossy());
+    io::stdout().flush()?;
+    eprintln!("tarloupe: mounted read-only; press Ctrl+C to unmount");
+    let _ = rx.recv();
+    drop(m);
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn mount(_a: Archive, _point: Option<OsString>) -> Result<()> {
+    unreachable!("checked before opening the archive")
 }
 
 fn main() -> ExitCode {

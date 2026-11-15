@@ -10,6 +10,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use std::sync::Mutex;
+
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 
 use crate::codec::Codec;
@@ -134,9 +136,39 @@ pub fn build_tree(members: Vec<Entry>) -> Vec<Entry> {
     out
 }
 
+/// An open index. Safe to share between threads: each query borrows a
+/// read-only connection from a small pool (opening another one when all are
+/// busy), so callbacks may query the index again.
 pub struct Index {
-    conn: Connection,
+    pool: Mutex<Vec<Connection>>,
     path: PathBuf,
+    /// The `meta` table as first opened. A connection opened later must see
+    /// the same, so that every connection reads the same index file even if
+    /// the path is replaced (a rebuild renames a new file over it).
+    meta: Vec<(String, String)>,
+}
+
+/// A pooled connection, returned to the pool on drop.
+struct Conn<'a> {
+    conn: Option<Connection>,
+    index: &'a Index,
+}
+
+impl std::ops::Deref for Conn<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        self.conn.as_ref().unwrap()
+    }
+}
+
+impl Drop for Conn<'_> {
+    fn drop(&mut self) {
+        if let (Some(c), Ok(mut pool)) = (self.conn.take(), self.index.pool.lock()) {
+            if pool.len() < 16 {
+                pool.push(c);
+            }
+        }
+    }
 }
 
 impl Index {
@@ -190,6 +222,15 @@ impl Index {
                     ("entry_count", entries.len().to_string()),
                     ("member_count", members.to_string()),
                     ("checkpoint_count", checkpoints.len().to_string()),
+                    // Unique per build (the temp file was created
+                    // exclusively), so two builds never look the same.
+                    (
+                        "generation",
+                        tmp.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned(),
+                    ),
                 ] {
                     meta.execute(params![k, v])?;
                 }
@@ -246,13 +287,33 @@ impl Index {
     }
 
     fn open_unchecked(path: &Path) -> Result<Index> {
-        let conn = Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+        let conn = open_read_only(path)?;
+        let meta = read_meta(&conn)?;
         Ok(Index {
-            conn,
+            pool: Mutex::new(vec![conn]),
             path: path.to_path_buf(),
+            meta,
+        })
+    }
+
+    fn conn(&self) -> Result<Conn<'_>> {
+        let pooled = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let conn = match pooled {
+            Some(c) => c,
+            None => {
+                let c = open_read_only(&self.path)?;
+                if read_meta(&c)? != self.meta {
+                    return Err(Error::StaleIndex {
+                        path: self.path.display().to_string(),
+                        reason: "the index file was replaced while in use".into(),
+                    });
+                }
+                c
+            }
+        };
+        Ok(Conn {
+            conn: Some(conn),
+            index: self,
         })
     }
 
@@ -290,7 +351,8 @@ impl Index {
 
     /// All decoder restart points, in stream order (windows not loaded).
     pub fn checkpoints(&self) -> Result<Vec<Point>> {
-        let mut stmt = self.conn.prepare(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare_cached(
             "SELECT uncompressed_offset, compressed_bit_offset FROM checkpoints \
              ORDER BY uncompressed_offset",
         )?;
@@ -305,7 +367,7 @@ impl Index {
 
     /// The packed window stored with the checkpoint at `uncompressed_offset`.
     pub fn checkpoint_window(&self, uncompressed_offset: u64) -> Result<Vec<u8>> {
-        Ok(self.conn.query_row(
+        Ok(self.conn()?.query_row(
             "SELECT state FROM checkpoints WHERE uncompressed_offset = ?1",
             [uncompressed_offset as i64],
             |r| Ok(r.get::<_, Option<Vec<u8>>>(0)?.unwrap_or_default()),
@@ -314,14 +376,15 @@ impl Index {
 
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
         Ok(self
-            .conn
+            .conn()?
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
             .optional()?)
     }
 
     /// Visits every archive member (not synthesised directories) in archive order.
     pub fn for_each_member(&self, mut f: impl FnMut(Entry) -> Result<()>) -> Result<()> {
-        let mut stmt = self.conn.prepare(&format!(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT {COLUMNS} FROM entries WHERE implicit = 0 ORDER BY id"
         ))?;
         let mut rows = stmt.query([])?;
@@ -333,7 +396,7 @@ impl Index {
 
     pub fn get(&self, id: i64) -> Result<Option<Entry>> {
         Ok(self
-            .conn
+            .conn()?
             .query_row(
                 &format!("SELECT {COLUMNS} FROM entries WHERE id = ?1"),
                 [id],
@@ -345,7 +408,7 @@ impl Index {
     /// Current (non-superseded) entry for a normalised path.
     pub fn lookup(&self, path: &[u8]) -> Result<Option<Entry>> {
         Ok(self
-            .conn
+            .conn()?
             .query_row(
                 &format!("SELECT {COLUMNS} FROM entries WHERE path = ?1 AND superseded = 0 ORDER BY id DESC LIMIT 1"),
                 [path],
@@ -359,7 +422,7 @@ impl Index {
     /// archived before them, even when the link reuses the same path.
     pub fn lookup_before(&self, path: &[u8], before: i64) -> Result<Option<Entry>> {
         Ok(self
-            .conn
+            .conn()?
             .query_row(
                 &format!(
                     "SELECT {COLUMNS} FROM entries WHERE path = ?1 AND id < ?2 AND implicit = 0 ORDER BY id DESC LIMIT 1"
@@ -372,12 +435,26 @@ impl Index {
 
     /// Current children of a directory (0 = archive root), sorted by name.
     pub fn children(&self, dir_id: i64) -> Result<Vec<Entry>> {
-        let mut stmt = self.conn.prepare(&format!(
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare_cached(&format!(
             "SELECT {COLUMNS} FROM entries WHERE parent_id = ?1 AND superseded = 0 AND path <> x'' ORDER BY name"
         ))?;
         let rows = stmt.query_map([dir_id], row_to_entry)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
+}
+
+fn read_meta(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut st = conn.prepare("SELECT key, value FROM meta ORDER BY key")?;
+    let rows = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+fn open_read_only(path: &Path) -> Result<Connection> {
+    Ok(Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?)
 }
 
 /// Creates (exclusively) a temporary file next to `path` that no other
@@ -430,4 +507,43 @@ fn row_to_entry(r: &Row<'_>) -> rusqlite::Result<Entry> {
         implicit: r.get(20)?,
         superseded: r.get(21)?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pooled_connections_never_mix_index_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.tli");
+        let key = |size| ArchiveKey {
+            size,
+            mtime_ns: 1,
+            sample_hash: 2,
+        };
+        let idx = Index::create(&path, &key(10), Codec::None, &[], &[]).unwrap();
+        // Keep the only pooled connection busy, so the next query opens a
+        // new one, then replace the file as a rebuild for another archive
+        // would (where the platform allows replacing an open file).
+        let generation = idx.meta("generation").unwrap().unwrap();
+        // Another archive, then the same archive again (equal metadata, but
+        // its checkpoints could differ): neither may be mixed in.
+        for size in [20, 10] {
+            let busy = idx.conn().unwrap();
+            let replaced = Index::create(&path, &key(size), Codec::None, &[], &[]);
+            // Unix lets a rebuild rename over an open index, so the
+            // replacement really happens there; Windows refuses it.
+            #[cfg(unix)]
+            let replaced = replaced.expect("replace the index");
+            drop(replaced);
+            match idx.meta("generation") {
+                Ok(v) => assert_eq!(v.as_ref(), Some(&generation)),
+                Err(Error::StaleIndex { .. }) => {}
+                Err(e) => panic!("{e}"),
+            }
+            drop(busy);
+            assert_eq!(idx.meta("generation").unwrap(), Some(generation.clone()));
+        }
+    }
 }

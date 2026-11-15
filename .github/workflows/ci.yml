@@ -22,6 +22,12 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The mount test needs WinFsp; with it installed the test must run.
+      - name: Install WinFsp
+        if: runner.os == 'Windows'
+        run: |
+          choco install winfsp -y --no-progress
+          echo "TARLOUPE_REQUIRE_WINFSP=1" >> $env:GITHUB_ENV
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked
       - run: cargo test --locked
