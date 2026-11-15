@@ -531,7 +531,12 @@ mod tests {
         // its checkpoints could differ): neither may be mixed in.
         for size in [20, 10] {
             let busy = idx.conn().unwrap();
-            drop(Index::create(&path, &key(size), Codec::None, &[], &[]));
+            let replaced = Index::create(&path, &key(size), Codec::None, &[], &[]);
+            // Unix lets a rebuild rename over an open index, so the
+            // replacement really happens there; Windows refuses it.
+            #[cfg(unix)]
+            let replaced = replaced.expect("replace the index");
+            drop(replaced);
             match idx.meta("generation") {
                 Ok(v) => assert_eq!(v.as_ref(), Some(&generation)),
                 Err(Error::StaleIndex { .. }) => {}
