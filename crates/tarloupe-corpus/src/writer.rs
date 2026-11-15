@@ -186,6 +186,7 @@ impl<W: Write> TarWriter<W> {
                     || m.mtime as u64 > OCTAL_SIZE_MAX
                     || dev_major > OCTAL_ID_MAX
                     || dev_minor > OCTAL_ID_MAX
+                    || m.mode as u64 > OCTAL_ID_MAX
                 {
                     self.skipped
                         .push(String::from_utf8_lossy(&m.path).into_owned());
@@ -367,6 +368,22 @@ fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ustar_skips_unencodable_numbers() {
+        let mut ok = Member::new("ok", Kind::File, 0, 0);
+        ok.mode = OCTAL_ID_MAX as u32;
+        let mut big_mode = Member::new("big-mode", Kind::File, 0, 0);
+        big_mode.mode = OCTAL_ID_MAX as u32 + 1;
+        let big_mtime = Member::new("big-mtime", Kind::File, 0, OCTAL_SIZE_MAX as i64 + 1);
+        let big_dev = Member::new("big-dev", Kind::CharDev(OCTAL_ID_MAX + 1, 0), 0, 0);
+        let mut w = TarWriter::new(Vec::new(), Format::Ustar);
+        assert!(w.append(&ok, &mut io::empty()).unwrap());
+        for m in [&big_mode, &big_mtime, &big_dev] {
+            assert!(!w.append(m, &mut io::empty()).unwrap());
+        }
+        assert_eq!(w.skipped, ["big-mode", "big-mtime", "big-dev"]);
+    }
 
     #[test]
     fn pax_len() {
