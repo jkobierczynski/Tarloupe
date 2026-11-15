@@ -72,13 +72,10 @@ pub fn browse(archive: &Path, opts: &Options, mut mounted: impl FnMut(&OsStr)) -
     let path = std::fs::canonicalize(archive)
         .with_context(|| format!("cannot open {}", archive.display()))?;
     // One mount per archive: a named mutex held for as long as it is mounted.
-    let folded: Vec<u16> = path
-        .as_os_str()
-        .to_string_lossy()
-        .to_uppercase()
-        .encode_utf16()
-        .collect();
-    let key = format!("{:016x}", fnv(folded));
+    // canonicalize returns the name as stored on disk, so every spelling of
+    // the same file gives the same key, while files that differ only in
+    // case (in a case-sensitive folder) stay apart.
+    let key = format!("{:016x}", fnv(path.as_os_str().encode_wide()));
     let state = state_dir().join(format!("{key}.mnt"));
     let name = wide(format!("Local\\Tarloupe-browse-{key}"));
     let mutex = unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) }
@@ -176,7 +173,7 @@ const TYPES: [(&str, Option<&str>); 3] = [
     (".tar", None),
     (".tgz", None),
     // Only `.tar.gz`, not every gzip file.
-    (".gz", Some("System.FileName:\"*.tar.gz\"")),
+    (".gz", Some("System.FileName:~\"*.tar.gz\"")),
 ];
 const VERB: &str = "Tarloupe.Browse";
 

@@ -46,20 +46,42 @@ impl Drop for Guard {
     }
 }
 
-/// Runs a command, failing the test if it takes longer than `limit`.
+/// Runs a command, failing the test (after killing it) if it takes longer
+/// than `limit`.
 fn run_within(mut cmd: Command, limit: Duration) -> Output {
-    let child = cmd
+    let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(child.wait_with_output());
+    let (mut out, mut err) = (child.stdout.take().unwrap(), child.stderr.take().unwrap());
+    let reader = std::thread::spawn(move || {
+        let (mut o, mut e) = (Vec::new(), Vec::new());
+        let t = std::thread::spawn(move || {
+            let _ = err.read_to_end(&mut e);
+            e
+        });
+        let _ = out.read_to_end(&mut o);
+        (o, t.join().unwrap())
     });
-    rx.recv_timeout(limit)
-        .expect("command did not finish in time")
-        .unwrap()
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            break s;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("command did not finish in {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let (stdout, stderr) = reader.join().unwrap();
+    Output {
+        status,
+        stdout,
+        stderr,
+    }
 }
 
 #[test]
