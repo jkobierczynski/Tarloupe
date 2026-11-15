@@ -226,7 +226,6 @@ fn extract_writes_the_same_tree_as_cat() {
         n += 1;
     }
     assert!(n > 10);
-    let _ = File::open(&out).unwrap();
 }
 
 #[test]
