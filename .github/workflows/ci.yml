@@ -28,6 +28,7 @@ jobs:
         run: |
           choco install winfsp -y --no-progress
           echo "TARLOUPE_REQUIRE_WINFSP=1" >> $env:GITHUB_ENV
+          echo "TARLOUPE_TEST_REGISTRY=1" >> $env:GITHUB_ENV
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --locked
       - run: cargo test --locked

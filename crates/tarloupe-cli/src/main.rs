@@ -92,6 +92,25 @@ enum Cmd {
         #[command(flatten)]
         idx: IndexOpts,
     },
+    /// Open the archive in an Explorer window (Windows, needs WinFsp). It is
+    /// mounted on a free drive letter and unmounted once every window and
+    /// file on it has been closed for the idle time. Running it again for
+    /// the same archive opens another window on the same mount.
+    Browse {
+        archive: PathBuf,
+        /// Seconds of idleness before unmounting.
+        #[arg(long, default_value_t = 120, value_name = "SECONDS")]
+        idle_timeout: u64,
+        /// Mount and print the drive letter, but open no window.
+        #[arg(long)]
+        no_window: bool,
+    },
+    /// Add or remove "Browse with Tarloupe" in Explorer's right-click menu
+    /// for .tar, .tgz and .tar.gz files (Windows, current user only).
+    Explorer {
+        #[command(subcommand)]
+        action: ExplorerAction,
+    },
     /// Show the archive as a read-only folder or drive (Windows, needs WinFsp).
     /// Runs until Ctrl+C, then unmounts.
     Mount {
@@ -102,6 +121,15 @@ enum Cmd {
         #[command(flatten)]
         idx: IndexOpts,
     },
+}
+
+#[derive(Subcommand)]
+enum ExplorerAction {
+    /// Add the right-click item. It runs `tarloupew.exe`, which must be
+    /// next to this program.
+    Install,
+    /// Remove the right-click item.
+    Uninstall,
 }
 
 fn open(archive: &PathBuf, idx: &IndexOpts, rebuild: bool) -> Result<Archive> {
@@ -312,6 +340,12 @@ fn run(cli: Cli) -> Result<()> {
                     .with_context(|| format!("{name}: cannot read"))?;
             }
         }
+        Cmd::Browse {
+            archive,
+            idle_timeout,
+            no_window,
+        } => browse(&archive, idle_timeout, no_window)?,
+        Cmd::Explorer { action } => explorer(action)?,
         Cmd::Mount {
             archive,
             mount_point,
@@ -329,6 +363,52 @@ fn run(cli: Cli) -> Result<()> {
     }
     out.flush()?;
     Ok(())
+}
+
+#[cfg(windows)]
+mod browse;
+
+#[cfg(windows)]
+fn browse(archive: &std::path::Path, idle: u64, no_window: bool) -> Result<()> {
+    let opts = browse::Options {
+        idle: std::time::Duration::from_secs(idle),
+        open_window: !no_window,
+    };
+    browse::browse(archive, &opts, |point| {
+        // Scripts (and the tests) wait for this line.
+        println!("{}", point.to_string_lossy());
+        let _ = io::stdout().flush();
+    })
+}
+
+#[cfg(windows)]
+fn explorer(action: ExplorerAction) -> Result<()> {
+    match action {
+        ExplorerAction::Install => {
+            let exe = browse::windowless_exe()?;
+            browse::install_verb(&exe)?;
+            eprintln!(
+                "tarloupe: added \"Browse with Tarloupe\" (runs {})",
+                exe.display()
+            );
+            eprintln!("tarloupe: on Windows 11 it is under \"Show more options\" for now");
+        }
+        ExplorerAction::Uninstall => {
+            browse::uninstall_verb()?;
+            eprintln!("tarloupe: removed \"Browse with Tarloupe\"");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn browse(_archive: &std::path::Path, _idle: u64, _no_window: bool) -> Result<()> {
+    anyhow::bail!("browse is only available on Windows (with WinFsp); use ls, cat or extract")
+}
+
+#[cfg(not(windows))]
+fn explorer(_action: ExplorerAction) -> Result<()> {
+    anyhow::bail!("the Explorer integration is only available on Windows")
 }
 
 #[cfg(windows)]

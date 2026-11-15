@@ -25,7 +25,21 @@ $ tarloupe extract big.tar.gz some/dir -C out   # extract a file or directory
 
 PS> tarloupe mount big.tar.gz               # Windows: next free drive, e.g. Z:
 PS> tarloupe mount big.tar.gz C:\mnt\big     # or a folder that does not exist yet
+PS> tarloupe browse big.tar.gz              # open it in Explorer; unmounts when idle
+PS> tarloupe explorer install               # add "Browse with Tarloupe" to the right-click menu
 ```
+
+**Browse with Tarloupe.** `tarloupe explorer install` adds a right-click
+item for `.tar`, `.tgz` and `.tar.gz` files, for the current user (no
+administrator rights; `tarloupe explorer uninstall` removes it). On
+Windows 11 it is under "Show more options" until the native menu entry
+arrives in M5. It runs `tarloupew.exe`, which must sit next to
+`tarloupe.exe`: it mounts the archive on a free drive letter, opens an
+Explorer window there, and unmounts once every window and file on it has
+been closed for two minutes (`tarloupe browse --idle-timeout` changes
+that). Browsing the same archive again opens another window on the same
+mount. The first browse of a big archive builds its index first, without
+a progress window yet (the tray app in the next part of M2 adds one).
 
 `tarloupe mount` needs [WinFsp](https://winfsp.dev/rel/)
 (`winget install WinFsp.WinFsp`). It prints the mount point, keeps the
@@ -93,6 +107,10 @@ archive with GNU tar and compares every file with what Tarloupe reads:
 devices and FIFOs are skipped with a note), refuses member paths with `..`,
 and never writes through an existing symlink in the destination.
 
+On Windows, CI also checks that `browse` shares one mount per archive,
+stays mounted while a file is open and unmounts once idle, and that the
+right-click item is added and removed.
+
 On Windows, CI installs WinFsp, mounts a gzip archive with the edge corpus
 and checks through the real file system that every folder lists the same
 names as the view, every file has the same bytes, lookups ignore case,
@@ -141,11 +159,11 @@ partly random, so compressors behave realistically.
 | Crate | Purpose |
 |---|---|
 | `tarloupe-core` | Platform-neutral library: codec detection, tar walker, SQLite index, random-access reads. No Windows code, so it builds and benchmarks on Linux. |
-| `tarloupe-cli` | The `tarloupe` command: `index`, `list`, `ls`, `cat`, `extract`, `mount`. |
+| `tarloupe-cli` | The `tarloupe` command: `index`, `list`, `ls`, `cat`, `extract`, `mount`, `browse`, `explorer`; and `tarloupew`, the console-less helper Explorer runs. |
 | `tarloupe-winfsp` | Read-only WinFsp file system over the core's Windows-shaped view (`tarloupe_core::vfs`). Empty on other platforms. |
 | `tarloupe-corpus` | Synthetic corpus generator and its standalone tar writer. |
 
-Later in M2: the Explorer verb and a tray app.
+Later in M2: a tray app and an installer.
 
 ## Roadmap
 
