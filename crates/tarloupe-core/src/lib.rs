@@ -17,6 +17,7 @@ pub mod key;
 pub mod listing;
 pub mod path;
 pub mod pax;
+pub mod vfs;
 pub mod walker;
 
 pub use archive::{Archive, OpenOptions};

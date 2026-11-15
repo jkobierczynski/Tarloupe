@@ -6,10 +6,11 @@ them. The first open builds a persistent seek index in one pass; every open
 after that is instant, and any file inside can be read without decompressing
 the archive from the start.
 
-> **Status: milestone M1 (gzip engine).** Plain `.tar` and `.tar.gz`,
-> through a command-line tool. Other compressed archives are detected and
-> reported; the Windows Explorer integration (WinFsp mount) arrives in M2
-> and xz/zstd/bzip2 in M3. See the [roadmap](#roadmap).
+> **Status: milestone M2 in progress (Windows mount).** Plain `.tar` and
+> `.tar.gz`, through a command-line tool, and on Windows as a read-only
+> folder or drive with `tarloupe mount`. The Explorer verb, tray app and
+> installer come next in M2; xz/zstd/bzip2 in M3. See the
+> [roadmap](#roadmap).
 
 ## What works today
 
@@ -21,7 +22,23 @@ $ tarloupe list -v big.tar.gz       # same output as `tar -tvf` (times in UTC)
 $ tarloupe ls -l big.tar.gz some/dir   # browse one directory
 $ tarloupe cat big.tar.gz some/dir/file.txt > file.txt
 $ tarloupe extract big.tar.gz some/dir -C out   # extract a file or directory
+
+PS> tarloupe mount big.tar.gz               # Windows: next free drive, e.g. Z:
+PS> tarloupe mount big.tar.gz C:\mnt\big     # or a folder that does not exist yet
 ```
+
+`tarloupe mount` needs [WinFsp](https://winfsp.dev/rel/)
+(`winget install WinFsp.WinFsp`). It prints the mount point, keeps the
+archive mounted until Ctrl+C, and works with Explorer, `dir`, editors and
+any other program. The volume is read-only. Windows needs every name in a
+folder to be legal and unique ignoring case, so names are shown the way
+Cygwin and WSL show them: `<>:"/\|?*`, control characters and a trailing
+dot or space become look-alike characters (U+F000 + the ASCII code), bytes
+that are not UTF-8 become U+F100 + the byte, `CON`, `NUL`, `COM1` and the
+other device names get their first letter mapped, names over 255
+characters are shortened with a hash, and names that differ only in case
+get ` (2)`, ` (3)`. Hard links and symlinks show the file or folder they
+point to; dangling links, devices and FIFOs are hidden.
 
 * **Tar formats:** v7, POSIX ustar, GNU (long names and links, base-256
   numbers for files over 8 GiB and large ids), POSIX pax (local and global
@@ -76,6 +93,11 @@ archive with GNU tar and compares every file with what Tarloupe reads:
 devices and FIFOs are skipped with a note), refuses member paths with `..`,
 and never writes through an existing symlink in the destination.
 
+On Windows, CI installs WinFsp, mounts a gzip archive with the edge corpus
+and checks through the real file system that every folder lists the same
+names as the view, every file has the same bytes, lookups ignore case,
+mapped names open, and writes, deletes and renames fail.
+
 ## Benchmark: one file out of a 4 GiB `.tar.gz`
 
 `scripts/bench-gzip.sh 4G /tmp/bench` generates a 4 GiB bulk corpus
@@ -119,19 +141,19 @@ partly random, so compressors behave realistically.
 | Crate | Purpose |
 |---|---|
 | `tarloupe-core` | Platform-neutral library: codec detection, tar walker, SQLite index, random-access reads. No Windows code, so it builds and benchmarks on Linux. |
-| `tarloupe-cli` | The `tarloupe` command: `index`, `list`, `ls`, `cat`, `extract`. |
+| `tarloupe-cli` | The `tarloupe` command: `index`, `list`, `ls`, `cat`, `extract`, `mount`. |
+| `tarloupe-winfsp` | Read-only WinFsp file system over the core's Windows-shaped view (`tarloupe_core::vfs`). Empty on other platforms. |
 | `tarloupe-corpus` | Synthetic corpus generator and its standalone tar writer. |
 
-Later milestones add `tarloupe-winfsp` (read-only file system), the Explorer
-verb and a tray app.
+Later in M2: the Explorer verb and a tray app.
 
 ## Roadmap
 
 | Milestone | Scope |
 |---|---|
 | **M0** Foundations | Workspace, corpus generator, tar walker, `.tar` index, CLI. *(done)* |
-| **M1** gzip engine | Checkpoint index with saved deflate windows, random reads, chunk cache, benchmarks. *(this release)* |
-| M2 Windows MVP | WinFsp read-only mount, "Browse with Tarloupe" in Explorer, tray app, installer. |
+| **M1** gzip engine | Checkpoint index with saved deflate windows, random reads, chunk cache, benchmarks. *(done)* |
+| **M2** Windows MVP | WinFsp read-only mount *(in progress)*, "Browse with Tarloupe" in Explorer, tray app, installer. |
 | M3 More codecs | Seekable/multi-frame zstd, multi-block xz, sequential fallback, `convert`. |
 | M4 Speed | Parallel gzip first pass, parallel bzip2. |
 | M5 Native feel | Shell namespace extension, Windows 11 context menu. |
@@ -146,6 +168,10 @@ cargo test
 
 The comparison tests need GNU tar on `PATH` (`tar` on Linux, or `gtar`);
 they are skipped when it is missing.
+
+On Windows, building needs LLVM (`winget install LLVM.LLVM`, for the WinFsp
+bindings) and the MSVC toolchain. The mount test is skipped when WinFsp is
+not installed, unless `TARLOUPE_REQUIRE_WINFSP=1`.
 
 ## License
 

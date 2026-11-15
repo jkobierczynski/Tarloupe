@@ -16,6 +16,13 @@ tarloupe-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+tarloupe-winfsp.workspace = true
+ctrlc = "3"
+
+[build-dependencies]
+winfsp = { version = "0.13", default-features = false, features = ["delayload"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 tarloupe-corpus = { path = "../tarloupe-corpus" }

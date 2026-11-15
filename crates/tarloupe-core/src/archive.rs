@@ -407,3 +407,9 @@ pub(crate) fn pread_exact(f: &File, mut buf: &mut [u8], mut off: u64) -> Result<
     }
     Ok(())
 }
+
+// File systems call into one archive from many threads.
+const _: () = {
+    const fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Archive>();
+};
