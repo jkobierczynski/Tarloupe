@@ -122,7 +122,9 @@ pub(crate) fn encode_sparse(chunks: &[SparseChunk]) -> Vec<u8> {
 }
 
 pub(crate) fn decode_sparse(b: &[u8]) -> Vec<SparseChunk> {
-    b.chunks_exact(16)
+    b.as_chunks::<16>()
+        .0
+        .iter()
         .map(|c| SparseChunk {
             offset: u64::from_le_bytes(c[..8].try_into().unwrap()),
             len: u64::from_le_bytes(c[8..].try_into().unwrap()),

@@ -342,7 +342,12 @@ impl<S: TarSource> Walker<S> {
                     .split(|&c| c == b',')
                     .filter_map(pax::parse_u64)
                     .collect();
-                let pairs: Vec<(u64, u64)> = nums.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+                let pairs: Vec<(u64, u64)> = nums
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&[a, b]| (a, b))
+                    .collect();
                 sparse = Some(to_chunks(&pairs));
                 size = get("GNU.sparse.size")
                     .and_then(pax::parse_u64)
@@ -445,7 +450,12 @@ impl<S: TarSource> Walker<S> {
                 }
             }
         }
-        let pairs: Vec<(u64, u64)> = numbers.chunks_exact(2).map(|c| (c[0], c[1])).collect();
+        let pairs: Vec<(u64, u64)> = numbers
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&[a, b]| (a, b))
+            .collect();
         Ok((to_chunks(&pairs), consumed))
     }
 
