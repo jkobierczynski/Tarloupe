@@ -38,6 +38,9 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 /// Seconds between 1601-01-01 and 1970-01-01.
 const EPOCH_DIFF: i64 = 11_644_473_600;
+/// Held from choosing a free drive letter until it is taken, so mounts made
+/// at once in one process do not pick the same letter.
+static PICK_DRIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Why mounting failed.
 #[derive(Debug)]
@@ -163,6 +166,7 @@ pub fn mount(archive: Arc<Archive>, point: Option<&OsStr>) -> Result<Mount, Moun
         .dir_info_timeout(60_000)
         .volume_info_timeout(60_000)
         .security_timeout(60_000);
+    let _picking = PICK_DRIVE.lock().unwrap_or_else(|e| e.into_inner());
     let point = match point {
         Some(p) => p.to_os_string(),
         None => free_drive().ok_or_else(|| MountError::WinFsp("no free drive letter".into()))?,

@@ -38,8 +38,13 @@ arrives in M5. It runs `tarloupew.exe`, which must sit next to
 Explorer window there, and unmounts once every window and file on it has
 been closed for two minutes (`tarloupe browse --idle-timeout` changes
 that). Browsing the same archive again opens another window on the same
-mount. The first browse of a big archive builds its index first, without
-a progress window yet (the tray app in the next part of M2 adds one).
+mount.
+
+`tarloupew.exe` runs as one tray agent per Windows session: browsing
+another archive hands it to the agent that is already running. Its tray
+icon shows how far a big archive's first indexing has got and what is
+mounted where; its menu opens or unmounts each archive, or unmounts all
+and quits. The agent leaves once nothing is mounted.
 
 `tarloupe mount` needs [WinFsp](https://winfsp.dev/rel/)
 (`winget install WinFsp.WinFsp`). It prints the mount point, keeps the
@@ -108,8 +113,10 @@ devices and FIFOs are skipped with a note), refuses member paths with `..`,
 and never writes through an existing symlink in the destination.
 
 On Windows, CI also checks that `browse` shares one mount per archive,
-stays mounted while a file is open and unmounts once idle, and that the
-right-click item is added and removed.
+stays mounted while a file is open and unmounts once idle, that a second
+`tarloupew` hands its archive to the running tray agent, which leaves once
+everything has gone idle, and that the right-click item is added and
+removed.
 
 On Windows, CI installs WinFsp, mounts a gzip archive with the edge corpus
 and checks through the real file system that every folder lists the same

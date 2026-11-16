@@ -301,3 +301,77 @@ fn extract_stays_inside_the_destination() {
     assert!(!dir.path().join("escape2.txt").exists());
     assert_eq!(fs::read(out.join("ok/fine.txt")).unwrap(), b"hi");
 }
+
+#[test]
+fn indexing_reports_progress_up_to_the_file_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let tar = sample_tar();
+    let plain = dir.path().join("p.tar");
+    let gz = dir.path().join("p.tar.gz");
+    fs::write(&plain, &tar).unwrap();
+    fs::write(&gz, gzip(&tar, 6, None).unwrap()).unwrap();
+    for path in [&plain, &gz] {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let opts = OpenOptions {
+            index_dir: Some(dir.path().join("idx")),
+            progress: Some(std::sync::Arc::new(move |done, total| {
+                s.lock().unwrap().push((done, total))
+            })),
+            ..Default::default()
+        };
+        Archive::open(path, &opts).unwrap();
+        let size = fs::metadata(path).unwrap().len();
+        let v = std::mem::take(&mut *seen.lock().unwrap());
+        assert!(v.len() >= 3, "{}: {v:?}", path.display());
+        assert_eq!(v.first(), Some(&(0, size)));
+        assert_eq!(v.last(), Some(&(size, size)));
+        assert!(v.iter().all(|&(d, t)| t == size && d <= size));
+        assert!(v.windows(2).all(|w| w[0].0 <= w[1].0), "went back: {v:?}");
+        // Loading the finished index reports nothing.
+        Archive::open(path, &opts).unwrap();
+        assert!(seen.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn cancelling_stops_indexing_and_leaves_no_index() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let dir = tempfile::tempdir().unwrap();
+    let tar = sample_tar();
+    let plain = dir.path().join("c.tar");
+    let gz = dir.path().join("c.tar.gz");
+    fs::write(&plain, &tar).unwrap();
+    fs::write(&gz, gzip(&tar, 6, None).unwrap()).unwrap();
+    // A small one reports no progress before the end, where it is cancelled.
+    let small = dir.path().join("small.tar");
+    let mut w = tarloupe_corpus::TarWriter::new(File::create(&small).unwrap(), Format::Gnu);
+    let m = tarloupe_corpus::Member::new("a", tarloupe_corpus::Kind::File, 1, 0);
+    w.append(&m, &mut &b"x"[..]).unwrap();
+    w.finish().unwrap();
+    for (i, path) in [&plain, &gz, &small].into_iter().enumerate() {
+        let idx = dir.path().join(format!("idx-{i}"));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let c = cancel.clone();
+        let opts = OpenOptions {
+            index_dir: Some(idx.clone()),
+            // Cancel as soon as indexing is under way.
+            progress: Some(Arc::new(move |done, _| {
+                if done > 0 {
+                    c.store(true, Ordering::Relaxed)
+                }
+            })),
+            cancel: Some(cancel),
+            ..Default::default()
+        };
+        match Archive::open(path, &opts) {
+            Err(tarloupe_core::Error::Cancelled) => {}
+            Err(e) => panic!("{}: {e}", path.display()),
+            Ok(_) => panic!("{}: not cancelled", path.display()),
+        }
+        let left = fs::read_dir(&idx).map_or(0, |d| d.count());
+        assert_eq!(left, 0, "{}: an index was left behind", path.display());
+        open(path, &idx, 1 << 20);
+    }
+}

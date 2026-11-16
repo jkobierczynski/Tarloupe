@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::codec::Codec;
@@ -17,7 +18,11 @@ use crate::walker::{ReadSource, SeekSource, Walker};
 /// Maximum symlink/hard-link hops when resolving an entry to its data.
 const MAX_LINK_HOPS: usize = 40;
 
-#[derive(Debug, Clone, Default)]
+/// Called while an index is built with the bytes of the archive file read
+/// so far and its total size.
+pub type Progress = Arc<dyn Fn(u64, u64) + Send + Sync>;
+
+#[derive(Clone, Default)]
 pub struct OpenOptions {
     /// Explicit index file (e.g. a sidecar `archive.tar.tli`).
     pub index_path: Option<PathBuf>,
@@ -31,6 +36,26 @@ pub struct OpenOptions {
     /// uncompressed bytes (default 8 MiB). Smaller is faster for random
     /// reads and makes the index larger.
     pub checkpoint_spacing: Option<u64>,
+    /// Told how far indexing has got, now and then (only when an index is
+    /// built).
+    pub progress: Option<Progress>,
+    /// When set while an index is built, building stops with
+    /// [`Error::Cancelled`].
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl std::fmt::Debug for OpenOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpenOptions")
+            .field("index_path", &self.index_path)
+            .field("index_dir", &self.index_dir)
+            .field("rebuild", &self.rebuild)
+            .field("require_index", &self.require_index)
+            .field("checkpoint_spacing", &self.checkpoint_spacing)
+            .field("progress", &self.progress.is_some())
+            .field("cancel", &self.cancel)
+            .finish()
+    }
 }
 
 /// What [`Archive::open`] did about the index.
@@ -93,7 +118,7 @@ impl Archive {
                     return Err(e)
                 }
                 Err(Error::StaleIndex { .. }) | Err(Error::Sqlite(_)) => (
-                    build_index(&file, &index_path, &key, codec, spacing)?,
+                    build_index(&file, &index_path, &key, codec, spacing, opts)?,
                     IndexStatus::Rebuilt,
                 ),
                 Err(e) => return Err(e),
@@ -106,7 +131,10 @@ impl Archive {
             } else {
                 IndexStatus::Built
             };
-            (build_index(&file, &index_path, &key, codec, spacing)?, st)
+            (
+                build_index(&file, &index_path, &key, codec, spacing, opts)?,
+                st,
+            )
         };
 
         let gzip = match codec {
@@ -359,23 +387,54 @@ fn build_index(
     key: &ArchiveKey,
     codec: Codec,
     spacing: u64,
+    opts: &OpenOptions,
 ) -> Result<Index> {
-    let (members, checkpoints) = match codec {
-        Codec::Gzip => {
-            let mut reader = IndexingReader::new(file.clone(), spacing)?;
-            let members = Walker::new(ReadSource::new(&mut reader)).collect::<Result<Vec<_>>>()?;
-            // The walker stops at the tar terminator; decode the rest so a
-            // damaged tail or a bad trailer CRC fails here, not later.
-            std::io::copy(&mut reader, &mut std::io::sink())?;
-            (members, std::mem::take(&mut reader.checkpoints))
-        }
-        _ => {
-            let mut reader = file.try_clone()?;
-            reader.seek(SeekFrom::Start(0))?;
-            let src = SeekSource::new(std::io::BufReader::with_capacity(64 * 1024, reader))?;
-            (Walker::new(src).collect::<Result<Vec<_>>>()?, Vec::new())
-        }
+    let mut report = Reporter {
+        progress: opts.progress.as_ref(),
+        cancel: opts.cancel.as_deref(),
+        total: key.size,
+        last: 0,
     };
+    report.start();
+    let walked = (|| -> Result<_> {
+        Ok(match codec {
+            Codec::Gzip => {
+                let mut reader = IndexingReader::new(file.clone(), spacing)?;
+                let members = {
+                    let mut r = GzProgress {
+                        inner: &mut reader,
+                        report: &mut report,
+                    };
+                    let members =
+                        Walker::new(ReadSource::new(&mut r)).collect::<Result<Vec<_>>>()?;
+                    // The walker stops at the tar terminator; decode the rest so
+                    // a damaged tail or a bad trailer CRC fails here, not later.
+                    std::io::copy(&mut r, &mut std::io::sink())?;
+                    members
+                };
+                (members, std::mem::take(&mut reader.checkpoints))
+            }
+            _ => {
+                let mut reader = file.try_clone()?;
+                reader.seek(SeekFrom::Start(0))?;
+                let counted = Counted {
+                    inner: reader,
+                    pos: 0,
+                    report: &mut report,
+                };
+                let src = SeekSource::new(std::io::BufReader::with_capacity(64 * 1024, counted))?;
+                (Walker::new(src).collect::<Result<Vec<_>>>()?, Vec::new())
+            }
+        })
+    })();
+    if report.cancelled() {
+        return Err(Error::Cancelled);
+    }
+    let (members, checkpoints) = walked?;
+    report.done();
+    if report.cancelled() {
+        return Err(Error::Cancelled); // cancelled just as it finished
+    }
     // Refuse to publish an index if the file changed while it was read.
     if ArchiveKey::from_file(file)? != *key {
         return Err(Error::Unsupported(
@@ -384,6 +443,89 @@ fn build_index(
     }
     let entries = build_tree(members);
     Index::create(index_path, key, codec, &entries, &checkpoints)
+}
+
+/// Passes indexing progress on, at most once per 1 MiB or 1% read.
+/// Also stops the reads once building is cancelled.
+struct Reporter<'a> {
+    progress: Option<&'a Progress>,
+    cancel: Option<&'a AtomicBool>,
+    total: u64,
+    last: u64,
+}
+
+impl Reporter<'_> {
+    fn cancelled(&self) -> bool {
+        self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+
+    fn at(&mut self, done: u64) -> std::io::Result<()> {
+        if self.cancelled() {
+            return Err(std::io::Error::other("indexing was cancelled"));
+        }
+        let Some(p) = self.progress else {
+            return Ok(());
+        };
+        let done = done.min(self.total);
+        let step = (self.total / 100).max(1 << 20);
+        if done.abs_diff(self.last) >= step {
+            self.last = done;
+            p(done, self.total);
+        }
+        Ok(())
+    }
+
+    fn start(&mut self) {
+        if let Some(p) = self.progress {
+            p(0, self.total);
+        }
+    }
+
+    fn done(&mut self) {
+        if let Some(p) = self.progress {
+            self.last = self.total;
+            p(self.total, self.total);
+        }
+    }
+}
+
+/// The gzip indexing reader, reporting how much compressed input it used.
+struct GzProgress<'a, 'b> {
+    inner: &'a mut IndexingReader,
+    report: &'a mut Reporter<'b>,
+}
+
+impl Read for GzProgress<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.report.at(self.inner.compressed_position())?;
+        Ok(n)
+    }
+}
+
+/// A plain file, reporting where it is.
+struct Counted<'a, 'b> {
+    inner: File,
+    pos: u64,
+    report: &'a mut Reporter<'b>,
+}
+
+impl Read for Counted<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.pos += n as u64;
+        self.report.at(self.pos)?;
+        Ok(n)
+    }
+}
+
+impl Seek for Counted<'_, '_> {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        // Not reported: setting up the walker seeks to the end to learn the
+        // length and back, and the next read reports the real position.
+        self.pos = self.inner.seek(to)?;
+        Ok(self.pos)
+    }
 }
 
 #[cfg(unix)]

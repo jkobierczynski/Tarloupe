@@ -20,7 +20,7 @@ pub mod pax;
 pub mod vfs;
 pub mod walker;
 
-pub use archive::{Archive, OpenOptions};
+pub use archive::{Archive, OpenOptions, Progress};
 pub use codec::Codec;
 pub use entry::{Entry, EntryKind, SparseChunk};
 pub use error::{Error, Result};

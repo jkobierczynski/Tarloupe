@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use tarloupe_core::{Archive, OpenOptions};
+use tarloupe_core::{Archive, OpenOptions, Progress};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
@@ -31,6 +31,10 @@ pub struct Options {
     pub idle: Duration,
     /// Open an Explorer window on the mount.
     pub open_window: bool,
+    /// Set to unmount now, even if something is still open.
+    pub stop: Arc<AtomicBool>,
+    /// Told how far indexing has got, if the archive has to be indexed.
+    pub progress: Option<Progress>,
 }
 
 impl Default for Options {
@@ -38,6 +42,8 @@ impl Default for Options {
         Options {
             idle: Duration::from_secs(120),
             open_window: true,
+            stop: Arc::default(),
+            progress: None,
         }
     }
 }
@@ -48,7 +54,7 @@ fn wide(s: impl AsRef<OsStr>) -> Vec<u16> {
 }
 
 /// A stable 64-bit FNV-1a hash (the same in every build of both programs).
-fn fnv(bytes: impl IntoIterator<Item = u16>) -> u64 {
+pub fn fnv(bytes: impl IntoIterator<Item = u16>) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
         for x in b.to_le_bytes() {
@@ -80,9 +86,11 @@ pub fn browse(archive: &Path, opts: &Options, mut mounted: impl FnMut(&OsStr)) -
     let name = wide(format!("Local\\Tarloupe-browse-{key}"));
     let mutex = unsafe { CreateMutexW(None, true, PCWSTR(name.as_ptr())) }
         .context("cannot create the browse lock")?;
+    let mut lock = MutexGuard(mutex, true);
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         // Another process has it (or is still indexing it). Wait until it
         // is mounted and just open a window, or take over if it exits.
+        lock.1 = false;
         loop {
             if let Some(point) = std::fs::read_to_string(&state)
                 .ok()
@@ -95,8 +103,12 @@ pub fn browse(archive: &Path, opts: &Options, mut mounted: impl FnMut(&OsStr)) -
                 }
                 return Ok(());
             }
+            if opts.stop.load(Ordering::Relaxed) {
+                return Ok(());
+            }
             let w = unsafe { WaitForSingleObject(mutex, 250) };
             if w == WAIT_OBJECT_0 || w == WAIT_ABANDONED {
+                lock.1 = true;
                 break; // the other process is gone; mount it here
             }
         }
@@ -106,16 +118,19 @@ pub fn browse(archive: &Path, opts: &Options, mut mounted: impl FnMut(&OsStr)) -
     let _ = std::fs::remove_file(&state);
     let result = serve(&path, &state, opts, &mut mounted);
     let _ = std::fs::remove_file(&state);
-    drop(MutexGuard(mutex));
+    drop(lock);
     result
 }
 
-struct MutexGuard(HANDLE);
+/// A mutex handle, released (if this thread owns it) and closed on drop.
+struct MutexGuard(HANDLE, bool);
 
 impl Drop for MutexGuard {
     fn drop(&mut self) {
         unsafe {
-            let _ = windows::Win32::System::Threading::ReleaseMutex(self.0);
+            if self.1 {
+                let _ = windows::Win32::System::Threading::ReleaseMutex(self.0);
+            }
             let _ = windows::Win32::Foundation::CloseHandle(self.0);
         }
     }
@@ -127,15 +142,25 @@ fn serve(
     opts: &Options,
     mounted: &mut impl FnMut(&OsStr),
 ) -> Result<()> {
-    let stop = Arc::new(AtomicBool::new(false));
-    {
-        let stop = stop.clone();
-        // Without a console there is nothing to press; that is fine.
-        let _ = ctrlc::set_handler(move || stop.store(true, Ordering::Relaxed));
+    let stop = &opts.stop;
+    let a = match Archive::open(
+        path,
+        &OpenOptions {
+            progress: opts.progress.clone(),
+            cancel: Some(stop.clone()),
+            ..Default::default()
+        },
+    ) {
+        Err(tarloupe_core::Error::Cancelled) => return Ok(()),
+        r => r.with_context(|| format!("cannot open {}", path.display()))?,
+    };
+    if stop.load(Ordering::Relaxed) {
+        return Ok(()); // asked to stop just as indexing finished
     }
-    let a = Archive::open(path, &OpenOptions::default())
-        .with_context(|| format!("cannot open {}", path.display()))?;
     let m = tarloupe_winfsp::mount(Arc::new(a), None)?;
+    if stop.load(Ordering::Relaxed) {
+        return Ok(()); // asked to stop while waiting to mount
+    }
     let point = m.mount_point().to_os_string();
     if let Some(dir) = state.parent() {
         std::fs::create_dir_all(dir)?;
@@ -158,7 +183,7 @@ fn serve(
     Ok(())
 }
 
-fn open_window(point: &OsStr) -> Result<()> {
+pub fn open_window(point: &OsStr) -> Result<()> {
     let mut dir = point.to_os_string();
     dir.push("\\");
     std::process::Command::new("explorer.exe")
