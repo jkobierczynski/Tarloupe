@@ -15,14 +15,23 @@
 
     <StandardDirectory Id="ProgramFiles64Folder">
       <Directory Id="INSTALLFOLDER" Name="Tarloupe">
-        <Component Id="Programs">
+        <!-- One file per component, so WiX can derive their GUIDs. -->
+        <Component Id="TarloupeExe">
           <File Id="tarloupe.exe" Source="$(BinDir)\tarloupe.exe" KeyPath="yes" />
-          <File Id="tarloupew.exe" Source="$(BinDir)\tarloupew.exe" />
-          <File Id="LICENSE_MIT" Name="LICENSE-MIT.txt" Source="$(Root)\LICENSE-MIT" />
-          <File Id="LICENSE_APACHE" Name="LICENSE-APACHE.txt" Source="$(Root)\LICENSE-APACHE" />
-          <File Id="README" Name="README.md" Source="$(Root)\README.md" />
           <Environment Id="PATH" Name="PATH" Value="[INSTALLFOLDER]" Action="set"
                        Part="last" System="yes" Permanent="no" />
+        </Component>
+        <Component Id="TarloupewExe">
+          <File Id="tarloupew.exe" Source="$(BinDir)\tarloupew.exe" KeyPath="yes" />
+        </Component>
+        <Component Id="LicenseMit">
+          <File Id="LICENSE_MIT" Name="LICENSE-MIT.txt" Source="$(Root)\LICENSE-MIT" KeyPath="yes" />
+        </Component>
+        <Component Id="LicenseApache">
+          <File Id="LICENSE_APACHE" Name="LICENSE-APACHE.txt" Source="$(Root)\LICENSE-APACHE" KeyPath="yes" />
+        </Component>
+        <Component Id="Readme">
+          <File Id="README" Name="README.md" Source="$(Root)\README.md" KeyPath="yes" />
         </Component>
 
         <!-- The same item `tarloupe explorer install` adds for one user. -->
@@ -53,7 +62,11 @@
     </StandardDirectory>
 
     <Feature Id="Main">
-      <ComponentRef Id="Programs" />
+      <ComponentRef Id="TarloupeExe" />
+      <ComponentRef Id="TarloupewExe" />
+      <ComponentRef Id="LicenseMit" />
+      <ComponentRef Id="LicenseApache" />
+      <ComponentRef Id="Readme" />
       <ComponentRef Id="VerbTar" />
       <ComponentRef Id="VerbTgz" />
       <ComponentRef Id="VerbGz" />

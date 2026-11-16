@@ -21,7 +21,7 @@ $Root = Split-Path -Parent $PSScriptRoot
 $WixVersion = '5.0.2'
 $WinFspVersion = '2.1.25156'
 $WinFspUrl = "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-$WinFspVersion.msi"
-$WinFspSha256 = ''
+$WinFspSha256 = '073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A'
 
 # Stops on a failed external command (PowerShell itself would carry on).
 function Check-Exit([string]$What) {
@@ -69,7 +69,9 @@ try {
     }
     $sig = Get-AuthenticodeSignature $WinFspMsi
     Write-Host "WinFsp signed by: $($sig.SignerCertificate.Subject) ($($sig.Status))"
-    if ($sig.Status -ne 'Valid') { throw "WinFsp installer signature is $($sig.Status)" }
+    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch '^CN=NAVIMATICS LLC,') {
+        throw "WinFsp installer is not validly signed by Navimatics ($($sig.Status))"
+    }
 
     $Msi = Join-Path $Root "dist\tarloupe-$Version-x64.msi"
     $Setup = Join-Path $Root "dist\tarloupe-setup-$Version-x64.exe"
