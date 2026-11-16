@@ -35,15 +35,34 @@ try {
     $Version = $m.Matches[0].Groups[1].Value
 
     if (-not $SkipCargo) {
-        cargo build --release --locked
-        Check-Exit 'cargo build'
+        # The C runtime is linked in, so the programs start on machines
+        # without the Visual C++ redistributable.
+        $saved = $env:RUSTFLAGS
+        $env:RUSTFLAGS = "$saved -C target-feature=+crt-static".Trim()
+        try {
+            cargo build --release --locked
+            Check-Exit 'cargo build'
+        }
+        finally {
+            $env:RUSTFLAGS = $saved
+        }
     }
     $Bin = Join-Path $Root 'target\release'
+    foreach ($exe in 'tarloupe.exe', 'tarloupew.exe') {
+        $text = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes((Join-Path $Bin $exe)))
+        if ($text -match '(?i)vcruntime140') {
+            throw "$exe needs the Visual C++ runtime; build it with -C target-feature=+crt-static"
+        }
+    }
 
     if (-not (Get-Command wix -ErrorAction SilentlyContinue)) {
         dotnet tool install --global wix --version $WixVersion
         Check-Exit 'installing WiX'
         $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
+    }
+    $foundWix = (wix --version) -join ''
+    if ($foundWix -notmatch '^5\.') {
+        throw "WiX $foundWix is on PATH; this script needs WiX 5 (dotnet tool update --global wix --version $WixVersion)"
     }
     $Work = Join-Path $Root 'target\installer'
     New-Item -ItemType Directory -Force $Work, (Join-Path $Root 'dist') | Out-Null
