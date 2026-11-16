@@ -45,18 +45,24 @@ try {
         Check-Exit 'installing WiX'
         $env:PATH += ";$env:USERPROFILE\.dotnet\tools"
     }
-    foreach ($ext in 'WixToolset.Util.wixext', 'WixToolset.Bal.wixext') {
-        # Adding one that is already there fails; that is fine.
-        wix extension add -g "$ext/$WixVersion" 2>&1 | Write-Host
-    }
-    $have = (wix extension list -g) -join "`n"
-    Write-Host "WiX extensions:`n$have"
-    foreach ($ext in 'WixToolset.Util.wixext', 'WixToolset.Bal.wixext') {
-        if ($have -notmatch [regex]::Escape($ext)) { throw "WiX extension $ext is missing" }
-    }
-
     $Work = Join-Path $Root 'target\installer'
     New-Item -ItemType Directory -Force $Work, (Join-Path $Root 'dist') | Out-Null
+    # The extensions come straight from their NuGet packages: `wix extension
+    # add` has been seen to leave the Bal one "damaged".
+    $Ext = @{}
+    foreach ($name in 'WixToolset.Util.wixext', 'WixToolset.Bal.wixext') {
+        $dir = Join-Path $Work "$name.$WixVersion"
+        if (-not (Test-Path $dir)) {
+            $pkg = "$dir.zip"
+            Invoke-WebRequest "https://www.nuget.org/api/v2/package/$name/$WixVersion" -OutFile $pkg
+            Expand-Archive $pkg $dir
+            Remove-Item $pkg
+        }
+        $dll = Get-ChildItem $dir -Recurse -Filter "$name.dll" | Select-Object -First 1
+        if (-not $dll) { throw "no $name.dll in the $name $WixVersion package" }
+        $Ext[$name] = $dll.FullName
+    }
+
     $WinFspMsi = Join-Path $Work "winfsp-$WinFspVersion.msi"
     if (-not (Test-Path $WinFspMsi)) {
         Write-Host "Downloading $WinFspUrl"
@@ -81,7 +87,7 @@ try {
         -d "Version=$Version" -d "Root=$Root" -d "BinDir=$Bin" -o $Msi
     Check-Exit 'building the MSI'
     wix build installer\Bundle.wxs -arch x64 `
-        -ext WixToolset.Util.wixext -ext WixToolset.Bal.wixext `
+        -ext $Ext['WixToolset.Util.wixext'] -ext $Ext['WixToolset.Bal.wixext'] `
         -d "Version=$Version" -d "Root=$Root" -d "WinFspMsi=$WinFspMsi" -d "TarloupeMsi=$Msi" -o $Setup
     Check-Exit 'building the setup program'
     Write-Host "Built $Msi"
