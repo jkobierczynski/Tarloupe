@@ -6,11 +6,11 @@ them. The first open builds a persistent seek index in one pass; every open
 after that is instant, and any file inside can be read without decompressing
 the archive from the start.
 
-> **Status: milestone M2 in progress (Windows mount).** Plain `.tar` and
+> **Status: 0.1.0, milestone M2 done (Windows MVP).** Plain `.tar` and
 > `.tar.gz`, through a command-line tool, and on Windows as a read-only
-> folder or drive with `tarloupe mount`. The Explorer verb, tray app and
-> installer come next in M2; xz/zstd/bzip2 in M3. See the
-> [roadmap](#roadmap).
+> drive from Explorer's "Browse with Tarloupe", with a tray icon and an
+> installer that brings WinFsp. xz/zstd/bzip2 come in M3. See the
+> [roadmap](#roadmap) and the [releases](https://github.com/jkobierczynski/Tarloupe/releases).
 
 ## What works today
 
@@ -179,7 +179,7 @@ partly random, so compressors behave realistically.
 |---|---|
 | **M0** Foundations | Workspace, corpus generator, tar walker, `.tar` index, CLI. *(done)* |
 | **M1** gzip engine | Checkpoint index with saved deflate windows, random reads, chunk cache, benchmarks. *(done)* |
-| **M2** Windows MVP | WinFsp read-only mount, "Browse with Tarloupe" in Explorer, tray app, installer. *(in review)* |
+| **M2** Windows MVP | WinFsp read-only mount, "Browse with Tarloupe" in Explorer, tray app, installer. *(done, 0.1.0)* |
 | M3 More codecs | Seekable/multi-frame zstd, multi-block xz, sequential fallback, `convert`. |
 | M4 Speed | Parallel gzip first pass, parallel bzip2. |
 | M5 Native feel | Shell namespace extension, Windows 11 context menu. |
@@ -214,6 +214,13 @@ which other programs may use. The script needs the .NET SDK (8 or later) to
 fetch the WiX toolset, and checks the WinFsp download's hash and signature.
 CI builds both, installs the setup program on a clean runner, mounts an
 archive with the bundled WinFsp and uninstalls again.
+
+### Releasing
+
+Bump `version` in `Cargo.toml`, add `release-notes/v<version>.md`, and push
+a tag `v<version>`. The release workflow builds and tests the installers
+from a clean tree and attaches them, with `SHA256SUMS.txt`, to a draft
+release, which goes public when someone publishes it on GitHub.
 
 ## License
 

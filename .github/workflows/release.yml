@@ -1,0 +1,53 @@
+name: Release
+
+# Pushing a tag like v0.1.0 builds the Windows installers, tests them on a
+# clean runner and attaches them to a draft release. Nothing is public until
+# someone publishes the draft on GitHub.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      # No build cache: release builds start from a clean tree.
+      - name: Check the tag matches the version and has notes
+        run: |
+          $tag = '${{ github.ref_name }}'
+          $m = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          $version = $m.Matches[0].Groups[1].Value
+          if ($tag -ne "v$version") { throw "tag $tag does not match version $version in Cargo.toml" }
+          if (-not (Test-Path "release-notes/$tag.md")) { throw "release-notes/$tag.md is missing" }
+      - name: Build the installers
+        run: ./installer/build.ps1
+      - name: Install, check and uninstall
+        run: ./installer/test.ps1 -Setup (Get-ChildItem dist/tarloupe-setup-*-x64.exe).FullName
+      - name: Checksums
+        working-directory: dist
+        run: |
+          Get-ChildItem *.exe, *.msi | Sort-Object Name | ForEach-Object {
+            "$((Get-FileHash $_ -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
+          } | Set-Content -Encoding ascii SHA256SUMS.txt
+          Get-Content SHA256SUMS.txt
+      - name: Draft the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ github.ref_name }}'
+          gh release create $tag --repo '${{ github.repository }}' --draft --verify-tag `
+            --title "Tarloupe $($tag.Substring(1))" --notes-file "release-notes/$tag.md" `
+            (Get-ChildItem dist/*.exe, dist/*.msi, dist/SHA256SUMS.txt).FullName
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed ($LASTEXITCODE)" }
