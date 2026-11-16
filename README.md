@@ -29,7 +29,8 @@ PS> tarloupe browse big.tar.gz              # open it in Explorer; unmounts when
 PS> tarloupe explorer install               # add "Browse with Tarloupe" to the right-click menu
 ```
 
-**Browse with Tarloupe.** `tarloupe explorer install` adds a right-click
+**Browse with Tarloupe.** The installer adds a right-click item for every
+user; without it, `tarloupe explorer install` adds the same
 item for `.tar`, `.tgz` and `.tar.gz` files, for the current user (no
 administrator rights; `tarloupe explorer uninstall` removes it). On
 Windows 11 it is under "Show more options" until the native menu entry
@@ -170,7 +171,7 @@ partly random, so compressors behave realistically.
 | `tarloupe-winfsp` | Read-only WinFsp file system over the core's Windows-shaped view (`tarloupe_core::vfs`). Empty on other platforms. |
 | `tarloupe-corpus` | Synthetic corpus generator and its standalone tar writer. |
 
-Later in M2: a tray app and an installer.
+`installer/` builds the Windows installers with WiX (see Building).
 
 ## Roadmap
 
@@ -178,7 +179,7 @@ Later in M2: a tray app and an installer.
 |---|---|
 | **M0** Foundations | Workspace, corpus generator, tar walker, `.tar` index, CLI. *(done)* |
 | **M1** gzip engine | Checkpoint index with saved deflate windows, random reads, chunk cache, benchmarks. *(done)* |
-| **M2** Windows MVP | WinFsp read-only mount *(in progress)*, "Browse with Tarloupe" in Explorer, tray app, installer. |
+| **M2** Windows MVP | WinFsp read-only mount, "Browse with Tarloupe" in Explorer, tray app, installer. *(in review)* |
 | M3 More codecs | Seekable/multi-frame zstd, multi-block xz, sequential fallback, `convert`. |
 | M4 Speed | Parallel gzip first pass, parallel bzip2. |
 | M5 Native feel | Shell namespace extension, Windows 11 context menu. |
@@ -197,6 +198,22 @@ they are skipped when it is missing.
 On Windows, building needs LLVM (`winget install LLVM.LLVM`, for the WinFsp
 bindings) and the MSVC toolchain. The mount test is skipped when WinFsp is
 not installed, unless `TARLOUPE_REQUIRE_WINFSP=1`.
+
+### Windows installer
+
+```powershell
+./installer/build.ps1
+```
+
+builds two files into `dist\`: `tarloupe-setup-<version>-x64.exe`, which
+installs WinFsp (unless some version is already installed) and then
+Tarloupe, and `tarloupe-<version>-x64.msi`, Tarloupe alone. Both install for
+all users into `Program Files\Tarloupe`, put it on `PATH` and add "Browse
+with Tarloupe" to Explorer. Uninstalling removes Tarloupe and leaves WinFsp,
+which other programs may use. The script needs the .NET SDK (8 or later) to
+fetch the WiX toolset, and checks the WinFsp download's hash and signature.
+CI builds both, installs the setup program on a clean runner, mounts an
+archive with the bundled WinFsp and uninstalls again.
 
 ## License
 

@@ -1,0 +1,75 @@
+<!--
+  The Tarloupe MSI: the two programs, the licences, the program folder on
+  PATH, and "Browse with Tarloupe" in Explorer's right-click menu for every
+  user. WinFsp is not in here; Bundle.wxs installs it alongside.
+  Built by build.ps1.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="Tarloupe" Manufacturer="Tarloupe" Version="$(Version)"
+           UpgradeCode="41F1A84A-53E2-4F4A-8981-4E5FADE913E0" Scope="perMachine">
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Tarloupe is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+    <Icon Id="tarloupe.ico" SourceFile="$(Root)\crates\tarloupe-cli\assets\tarloupe.ico" />
+    <Property Id="ARPPRODUCTICON" Value="tarloupe.ico" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/jkobierczynski/Tarloupe" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Tarloupe">
+        <!-- One file per component, so WiX can derive their GUIDs. -->
+        <Component Id="TarloupeExe">
+          <File Id="tarloupe.exe" Source="$(BinDir)\tarloupe.exe" KeyPath="yes" />
+          <Environment Id="PATH" Name="PATH" Value="[INSTALLFOLDER]" Action="set"
+                       Part="last" System="yes" Permanent="no" />
+        </Component>
+        <Component Id="TarloupewExe">
+          <File Id="tarloupew.exe" Source="$(BinDir)\tarloupew.exe" KeyPath="yes" />
+        </Component>
+        <Component Id="LicenseMit">
+          <File Id="LICENSE_MIT" Name="LICENSE-MIT.txt" Source="$(Root)\LICENSE-MIT" KeyPath="yes" />
+        </Component>
+        <Component Id="LicenseApache">
+          <File Id="LICENSE_APACHE" Name="LICENSE-APACHE.txt" Source="$(Root)\LICENSE-APACHE" KeyPath="yes" />
+        </Component>
+        <Component Id="Readme">
+          <File Id="README" Name="README.md" Source="$(Root)\README.md" KeyPath="yes" />
+        </Component>
+
+        <!-- The same item `tarloupe explorer install` adds for one user. -->
+        <Component Id="VerbTar">
+          <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.tar\shell\Tarloupe.Browse">
+            <RegistryValue Name="MUIVerb" Type="string" Value="Browse with Tarloupe" KeyPath="yes" />
+            <RegistryValue Name="Icon" Type="string" Value="[#tarloupew.exe],0" />
+            <RegistryValue Key="command" Type="string" Value="&quot;[#tarloupew.exe]&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </Component>
+        <Component Id="VerbTgz">
+          <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.tgz\shell\Tarloupe.Browse">
+            <RegistryValue Name="MUIVerb" Type="string" Value="Browse with Tarloupe" KeyPath="yes" />
+            <RegistryValue Name="Icon" Type="string" Value="[#tarloupew.exe],0" />
+            <RegistryValue Key="command" Type="string" Value="&quot;[#tarloupew.exe]&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </Component>
+        <Component Id="VerbGz">
+          <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.gz\shell\Tarloupe.Browse">
+            <RegistryValue Name="MUIVerb" Type="string" Value="Browse with Tarloupe" KeyPath="yes" />
+            <RegistryValue Name="Icon" Type="string" Value="[#tarloupew.exe],0" />
+            <!-- Only .tar.gz, not every gzip file. -->
+            <RegistryValue Name="AppliesTo" Type="string" Value="System.FileName:~&quot;*.tar.gz&quot;" />
+            <RegistryValue Key="command" Type="string" Value="&quot;[#tarloupew.exe]&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main">
+      <ComponentRef Id="TarloupeExe" />
+      <ComponentRef Id="TarloupewExe" />
+      <ComponentRef Id="LicenseMit" />
+      <ComponentRef Id="LicenseApache" />
+      <ComponentRef Id="Readme" />
+      <ComponentRef Id="VerbTar" />
+      <ComponentRef Id="VerbTgz" />
+      <ComponentRef Id="VerbGz" />
+    </Feature>
+  </Package>
+</Wix>

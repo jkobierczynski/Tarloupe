@@ -26,12 +26,13 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
     DestroyMenu, DestroyWindow, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW,
-    GetWindowThreadProcessId, LoadIconW, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, SendMessageTimeoutW, SetForegroundWindow, SetTimer, TrackPopupMenu,
-    TranslateMessage, HMENU, IDI_APPLICATION, MENU_ITEM_FLAGS, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MSG, SMTO_ABORTIFHUNG, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP,
-    WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP,
-    WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
+    GetSystemMetrics, GetWindowThreadProcessId, LoadIconW, LoadImageW, PostMessageW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendMessageTimeoutW,
+    SetForegroundWindow, SetTimer, TrackPopupMenu, TranslateMessage, HICON, HMENU, IDI_APPLICATION,
+    IMAGE_ICON, LR_SHARED, MENU_ITEM_FLAGS, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG,
+    SMTO_ABORTIFHUNG, SM_CXSMICON, SM_CYSMICON, TPM_BOTTOMALIGN, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
+    WM_APP, WM_COMMAND, WM_CONTEXTMENU, WM_COPYDATA, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
+    WM_RBUTTONUP, WM_TIMER, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::browse;
@@ -270,7 +271,7 @@ impl Agent {
             uID: 1,
             uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
             uCallbackMessage: WM_TRAY,
-            hIcon: unsafe { LoadIconW(None, IDI_APPLICATION) }.unwrap_or_default(),
+            hIcon: tray_icon(),
             ..Default::default()
         };
         let tip: Vec<u16> = OsStr::new(&self.tip()).encode_wide().collect();
@@ -386,6 +387,28 @@ impl Agent {
             .map(|j| j.state.clone())
         {
             let _ = browse::open_window(&p);
+        }
+    }
+}
+
+/// The program's own icon at the tray's size, or the stock one if the
+/// program has none (as in cross builds).
+fn tray_icon() -> HICON {
+    unsafe {
+        let own = GetModuleHandleW(None).ok().and_then(|m| {
+            LoadImageW(
+                Some(m.into()),
+                PCWSTR(std::ptr::without_provenance(1)), // MAKEINTRESOURCE(1)
+                IMAGE_ICON,
+                GetSystemMetrics(SM_CXSMICON),
+                GetSystemMetrics(SM_CYSMICON),
+                LR_SHARED,
+            )
+            .ok()
+        });
+        match own {
+            Some(h) => HICON(h.0),
+            None => LoadIconW(None, IDI_APPLICATION).unwrap_or_default(),
         }
     }
 }

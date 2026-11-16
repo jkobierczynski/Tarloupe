@@ -44,3 +44,25 @@ jobs:
       - uses: dtolnay/rust-toolchain@1.89.0
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --all-targets --locked
+
+  # Builds the MSI and the setup program that bundles WinFsp, installs it on
+  # a clean runner, mounts an archive with the bundled WinFsp, uninstalls.
+  installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The runner has the .NET SDK, which the script uses to get WiX.
+      - name: Build the installers
+        run: ./installer/build.ps1
+      - name: Install, check and uninstall
+        run: ./installer/test.ps1 -Setup (Get-ChildItem dist/tarloupe-setup-*-x64.exe).FullName
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tarloupe-installers
+          path: |
+            dist/*.msi
+            dist/*.exe
+          if-no-files-found: ignore
