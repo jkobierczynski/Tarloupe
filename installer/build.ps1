@@ -71,14 +71,18 @@ try {
     $Ext = @{}
     foreach ($name in 'WixToolset.Util.wixext', 'WixToolset.Bal.wixext') {
         $dir = Join-Path $Work "$name.$WixVersion"
-        if (-not (Test-Path $dir)) {
+        # The Bal package's DLL is WixToolset.BootstrapperApplications.wixext.dll.
+        $find = { Get-ChildItem (Join-Path $dir 'wixext5') -Filter '*.wixext.dll' -ErrorAction SilentlyContinue | Select-Object -First 1 }
+        $dll = & $find
+        if (-not $dll) {
+            # Missing, or left half there by an earlier run or a CI cache.
+            if (Test-Path $dir) { Remove-Item -Recurse -Force $dir }
             $pkg = "$dir.zip"
             Invoke-WebRequest "https://www.nuget.org/api/v2/package/$name/$WixVersion" -OutFile $pkg
             Expand-Archive $pkg $dir
             Remove-Item $pkg
+            $dll = & $find
         }
-        # The Bal package's DLL is WixToolset.BootstrapperApplications.wixext.dll.
-        $dll = Get-ChildItem (Join-Path $dir 'wixext5') -Filter '*.wixext.dll' | Select-Object -First 1
         if (-not $dll) { throw "no wixext5\*.wixext.dll in the $name $WixVersion package" }
         $Ext[$name] = $dll.FullName
     }
