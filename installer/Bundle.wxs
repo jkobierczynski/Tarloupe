@@ -1,0 +1,30 @@
+<!--
+  tarloupe-setup-x64.exe: installs WinFsp (unless some version of it is
+  already there) and then the Tarloupe MSI. Uninstalling it leaves WinFsp,
+  which other programs may use. Built by build.ps1.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Bundle Name="Tarloupe" Manufacturer="Tarloupe" Version="$(Version)"
+          UpgradeCode="B20FC306-003F-456F-8A47-703192E43641"
+          IconSourceFile="$(Root)\crates\tarloupe-cli\assets\tarloupe.ico"
+          AboutUrl="https://github.com/jkobierczynski/Tarloupe">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication
+          Theme="hyperlinkLicense"
+          LicenseUrl="https://github.com/jkobierczynski/Tarloupe/blob/main/LICENSE-MIT"
+          LogoFile="$(Root)\installer\logo.png" />
+    </BootstrapperApplication>
+
+    <!-- WinFsp records where it is installed in the 32-bit registry view. -->
+    <util:RegistrySearch Id="FindWinFsp" Root="HKLM" Key="SOFTWARE\WinFsp" Value="InstallDir"
+                         Variable="WinFspDir" Bitness="always32" />
+
+    <Chain>
+      <MsiPackage Id="WinFsp" SourceFile="$(WinFspMsi)" Permanent="yes" Visible="yes"
+                  InstallCondition="NOT WinFspDir" />
+      <MsiPackage Id="Tarloupe" SourceFile="$(TarloupeMsi)" />
+    </Chain>
+  </Bundle>
+</Wix>

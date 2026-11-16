@@ -38,6 +38,7 @@ windows = { version = "0.61", features = [
 
 [build-dependencies]
 winfsp = { version = "0.13", default-features = false, features = ["delayload"] }
+embed-resource = "3"
 
 [dev-dependencies]
 tempfile.workspace = true
