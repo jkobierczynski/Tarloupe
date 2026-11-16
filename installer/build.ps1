@@ -58,8 +58,9 @@ try {
             Expand-Archive $pkg $dir
             Remove-Item $pkg
         }
-        $dll = Get-ChildItem $dir -Recurse -Filter "$name.dll" | Select-Object -First 1
-        if (-not $dll) { throw "no $name.dll in the $name $WixVersion package" }
+        # The Bal package's DLL is WixToolset.BootstrapperApplications.wixext.dll.
+        $dll = Get-ChildItem (Join-Path $dir 'wixext5') -Filter '*.wixext.dll' | Select-Object -First 1
+        if (-not $dll) { throw "no wixext5\*.wixext.dll in the $name $WixVersion package" }
         $Ext[$name] = $dll.FullName
     }
 
