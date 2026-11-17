@@ -67,7 +67,8 @@ impl fmt::Display for MountError {
 
 impl std::error::Error for MountError {}
 
-fn fsp(e: windows::core::Error) -> MountError {
+/// WinFsp's host API reports errors from its own windows-rs version.
+fn fsp(e: impl std::fmt::Display) -> MountError {
     MountError::WinFsp(e.to_string())
 }
 
