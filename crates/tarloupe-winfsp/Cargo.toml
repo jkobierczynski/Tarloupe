@@ -9,8 +9,9 @@ repository.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 tarloupe-core.workspace = true
-winfsp = "0.13"
-windows = { version = "0.61", features = [
+# WinFsp's own API uses windows 0.61; this feature adds the 0.62 conversions.
+winfsp = { version = "0.13", features = ["windows-62"] }
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
