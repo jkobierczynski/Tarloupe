@@ -16,3 +16,7 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    ignore:
+      # Its refs name Rust toolchains, not releases of the action: the MSRV
+      # job pins @1.89.0 to match rust-version, and @stable must stay as is.
+      - dependency-name: dtolnay/rust-toolchain
