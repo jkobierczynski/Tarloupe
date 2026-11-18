@@ -25,7 +25,7 @@ function Setup([string[]]$Arguments, [string]$Log) {
 
 $Dir = Join-Path $env:ProgramFiles 'Tarloupe'
 $WinFspKey = 'HKLM:\SOFTWARE\WOW6432Node\WinFsp'
-$VerbKeys = '.tar', '.tgz', '.gz' | ForEach-Object {
+$VerbKeys = '.tar', '.tgz', '.gz', '.txz', '.xz', '.tzst', '.zst', '.tbz2', '.tbz', '.bz2' | ForEach-Object {
     "Registry::HKEY_LOCAL_MACHINE\Software\Classes\SystemFileAssociations\$_\shell\Tarloupe.Browse"
 }
 function OnPath {

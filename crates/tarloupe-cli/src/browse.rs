@@ -193,12 +193,19 @@ pub fn open_window(point: &OsStr) -> Result<()> {
     Ok(())
 }
 
-/// File types that get the right-click item, and for `.gz` which names.
-const TYPES: [(&str, Option<&str>); 3] = [
+/// File types that get the right-click item, and for the plain
+/// compression extensions which names: only `.tar.gz`, not every gzip file.
+pub const TYPES: [(&str, Option<&str>); 10] = [
     (".tar", None),
     (".tgz", None),
-    // Only `.tar.gz`, not every gzip file.
     (".gz", Some("System.FileName:~\"*.tar.gz\"")),
+    (".txz", None),
+    (".xz", Some("System.FileName:~\"*.tar.xz\"")),
+    (".tzst", None),
+    (".zst", Some("System.FileName:~\"*.tar.zst\"")),
+    (".tbz2", None),
+    (".tbz", None),
+    (".bz2", Some("System.FileName:~\"*.tar.bz2\"")),
 ];
 const VERB: &str = "Tarloupe.Browse";
 

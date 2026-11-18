@@ -53,8 +53,63 @@
           <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.gz\shell\Tarloupe.Browse">
             <RegistryValue Name="MUIVerb" Type="string" Value="Browse with Tarloupe" KeyPath="yes" />
             <RegistryValue Name="Icon" Type="string" Value="[#tarloupew.exe],0" />
-            <!-- Only .tar.gz, not every gzip file. -->
+            <!-- Only .tar.gz, not every .gz file. -->
             <RegistryValue Name="AppliesTo" Type="string" Value="System.FileName:~&quot;*.tar.gz&quot;" />
+            <RegistryValue Key="command" Type="string" Value="&quot;[#tarloupew.exe]&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </Component>
+        <Component Id="VerbTxz">
+          <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.txz\shell\Tarloupe.Browse">
+            <RegistryValue Name="MUIVerb" Type="string" Value="Browse with Tarloupe" KeyPath="yes" />
+            <RegistryValue Name="Icon" Type="string" Value="[#tarloupew.exe],0" />
+            <RegistryValue Key="command" Type="string" Value="&quot;[#tarloupew.exe]&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </Component>
+        <Component Id="VerbXz">
+          <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.xz\shell\Tarloupe.Browse">
+            <RegistryValue Name="MUIVerb" Type="string" Value="Browse with Tarloupe" KeyPath="yes" />
+            <RegistryValue Name="Icon" Type="string" Value="[#tarloupew.exe],0" />
+            <!-- Only .tar.xz, not every .xz file. -->
+            <RegistryValue Name="AppliesTo" Type="string" Value="System.FileName:~&quot;*.tar.xz&quot;" />
+            <RegistryValue Key="command" Type="string" Value="&quot;[#tarloupew.exe]&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </Component>
+        <Component Id="VerbTzst">
+          <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.tzst\shell\Tarloupe.Browse">
+            <RegistryValue Name="MUIVerb" Type="string" Value="Browse with Tarloupe" KeyPath="yes" />
+            <RegistryValue Name="Icon" Type="string" Value="[#tarloupew.exe],0" />
+            <RegistryValue Key="command" Type="string" Value="&quot;[#tarloupew.exe]&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </Component>
+        <Component Id="VerbZst">
+          <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.zst\shell\Tarloupe.Browse">
+            <RegistryValue Name="MUIVerb" Type="string" Value="Browse with Tarloupe" KeyPath="yes" />
+            <RegistryValue Name="Icon" Type="string" Value="[#tarloupew.exe],0" />
+            <!-- Only .tar.zst, not every .zst file. -->
+            <RegistryValue Name="AppliesTo" Type="string" Value="System.FileName:~&quot;*.tar.zst&quot;" />
+            <RegistryValue Key="command" Type="string" Value="&quot;[#tarloupew.exe]&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </Component>
+        <Component Id="VerbTbz2">
+          <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.tbz2\shell\Tarloupe.Browse">
+            <RegistryValue Name="MUIVerb" Type="string" Value="Browse with Tarloupe" KeyPath="yes" />
+            <RegistryValue Name="Icon" Type="string" Value="[#tarloupew.exe],0" />
+            <RegistryValue Key="command" Type="string" Value="&quot;[#tarloupew.exe]&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </Component>
+        <Component Id="VerbTbz">
+          <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.tbz\shell\Tarloupe.Browse">
+            <RegistryValue Name="MUIVerb" Type="string" Value="Browse with Tarloupe" KeyPath="yes" />
+            <RegistryValue Name="Icon" Type="string" Value="[#tarloupew.exe],0" />
+            <RegistryValue Key="command" Type="string" Value="&quot;[#tarloupew.exe]&quot; &quot;%1&quot;" />
+          </RegistryKey>
+        </Component>
+        <Component Id="VerbBz2">
+          <RegistryKey Root="HKLM" Key="Software\Classes\SystemFileAssociations\.bz2\shell\Tarloupe.Browse">
+            <RegistryValue Name="MUIVerb" Type="string" Value="Browse with Tarloupe" KeyPath="yes" />
+            <RegistryValue Name="Icon" Type="string" Value="[#tarloupew.exe],0" />
+            <!-- Only .tar.bz2, not every .bz2 file. -->
+            <RegistryValue Name="AppliesTo" Type="string" Value="System.FileName:~&quot;*.tar.bz2&quot;" />
             <RegistryValue Key="command" Type="string" Value="&quot;[#tarloupew.exe]&quot; &quot;%1&quot;" />
           </RegistryKey>
         </Component>
@@ -70,6 +125,13 @@
       <ComponentRef Id="VerbTar" />
       <ComponentRef Id="VerbTgz" />
       <ComponentRef Id="VerbGz" />
+      <ComponentRef Id="VerbTxz" />
+      <ComponentRef Id="VerbXz" />
+      <ComponentRef Id="VerbTzst" />
+      <ComponentRef Id="VerbZst" />
+      <ComponentRef Id="VerbTbz2" />
+      <ComponentRef Id="VerbTbz" />
+      <ComponentRef Id="VerbBz2" />
     </Feature>
   </Package>
 </Wix>

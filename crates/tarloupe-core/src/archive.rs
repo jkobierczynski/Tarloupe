@@ -9,10 +9,11 @@ use std::sync::Arc;
 use crate::codec::Codec;
 use crate::entry::{Entry, EntryKind};
 use crate::error::{Error, Result};
-use crate::gzip::{self, GzRandom, IndexingReader};
+use crate::gzip::{self, IndexingReader};
 use crate::index::{build_tree, default_index_dir, Index};
 use crate::key::ArchiveKey;
 use crate::path::{normalize, resolve_link};
+use crate::stream::{Decoder, Indexer, Opener, Point, RandomReader};
 use crate::walker::{ReadSource, SeekSource, Walker};
 
 /// Maximum symlink/hard-link hops when resolving an entry to its data.
@@ -72,7 +73,10 @@ pub struct Archive {
     codec: Codec,
     index: Index,
     status: IndexStatus,
-    gzip: Option<GzRandom>,
+    /// Decompresses the tar stream (`None` for a plain tar).
+    reader: Option<RandomReader>,
+    /// Restart points, in stream order.
+    points: Vec<Point>,
 }
 
 impl Archive {
@@ -81,12 +85,6 @@ impl Archive {
         let path = path.as_ref().to_path_buf();
         let mut file = File::open(&path)?;
         let codec = detect(&mut file)?;
-        if !matches!(codec, Codec::None | Codec::Gzip) {
-            return Err(Error::UnsupportedCodec {
-                codec: codec.name(),
-                milestone: codec.milestone(),
-            });
-        }
         // Key and index come from the handle we keep for reads, so they
         // describe the same file even if the path is replaced meanwhile.
         let key = ArchiveKey::from_file(&file)?;
@@ -137,17 +135,16 @@ impl Archive {
             )
         };
 
-        let gzip = match codec {
-            Codec::Gzip => Some(GzRandom::new(file.clone(), index.checkpoints()?)),
-            _ => None,
-        };
+        let points = index.checkpoints()?;
+        let reader = opener(codec, &file).map(|o| RandomReader::new(points.clone(), o));
         Ok(Archive {
             path,
             file,
             codec,
             index,
             status,
-            gzip,
+            reader,
+            points,
         })
     }
 
@@ -165,6 +162,58 @@ impl Archive {
     }
     pub fn index_status(&self) -> IndexStatus {
         self.status
+    }
+
+    /// Length of the uncompressed tar stream, when the index records it.
+    pub fn stream_size(&self) -> Option<u64> {
+        self.index.meta("stream_size").ok().flatten()?.parse().ok()
+    }
+
+    /// The largest stretch of the uncompressed stream that has no restart
+    /// point: a read may have to decode up to this much first.
+    pub fn max_decode_distance(&self) -> u64 {
+        if self.codec == Codec::None {
+            return 0;
+        }
+        // Indexes from 0.1 do not record the stream size; the compressed
+        // size is a lower bound for it.
+        let end = self
+            .stream_size()
+            .unwrap_or_else(|| std::fs::metadata(&self.path).map_or(0, |m| m.len()));
+        let mut prev = 0;
+        let mut gap = 0;
+        for p in &self.points {
+            gap = gap.max(p.uncompressed_offset - prev);
+            prev = p.uncompressed_offset;
+        }
+        gap.max(end.saturating_sub(prev))
+    }
+
+    /// Why reads from this archive are slow, when they are: some of its
+    /// data can only be reached by decoding a long way (more than 64 MiB).
+    pub fn slow_access(&self) -> Option<&'static str> {
+        if self.max_decode_distance() <= SLOW_DISTANCE {
+            return None;
+        }
+        Some(match self.codec {
+            Codec::None => return None,
+            Codec::Gzip => {
+                "this gzip file is written as one huge deflate block (as some fast \
+                 compressors do), so reads have to decode it from the start"
+            }
+            Codec::Zstd => {
+                "this zstd file is one single frame (what `zstd` writes by default), \
+                 so reads have to decode it from the start"
+            }
+            Codec::Xz => {
+                "this xz file is one single block (what single-threaded `xz` writes), \
+                 so reads have to decode it from the start"
+            }
+            Codec::Bzip2 => {
+                "this bzip2 file is one single stream, and Tarloupe cannot yet jump \
+                 into the middle of a bzip2 stream, so reads decode it from the start"
+            }
+        })
     }
 
     /// Members in archive order, as `tar -t` lists them.
@@ -290,15 +339,15 @@ impl Archive {
 
     /// Reads `buf.len()` bytes of the (uncompressed) tar stream at `off`.
     fn read_stream(&self, buf: &mut [u8], off: u64) -> Result<()> {
-        match &self.gzip {
+        match &self.reader {
             None => pread_exact(&self.file, buf, off),
-            Some(gz) => {
-                let window = |at: u64| {
+            Some(r) => {
+                let state = |at: u64| {
                     self.index
                         .checkpoint_window(at)
                         .map_err(|e| std::io::Error::other(e.to_string()))
                 };
-                gz.read_exact_at(buf, off, &window).map_err(|e| {
+                r.read_exact_at(buf, off, &state).map_err(|e| {
                     if e.kind() == std::io::ErrorKind::UnexpectedEof {
                         Error::corrupt(off, "the archive ends before this member's data")
                     } else {
@@ -325,7 +374,34 @@ impl Archive {
     }
 }
 
-fn detect(file: &mut File) -> Result<Codec> {
+/// Reads with a longer decode distance than this are reported as slow.
+const SLOW_DISTANCE: u64 = 64 << 20;
+
+/// Makes decoders for a compressed codec.
+fn opener(codec: Codec, file: &Arc<File>) -> Option<Opener> {
+    let file = file.clone();
+    match codec {
+        Codec::None => None,
+        Codec::Gzip => Some(gzip::opener(file)),
+        Codec::Zstd => Some(crate::zstd::opener(file)),
+        Codec::Xz => Some(crate::xz::opener(file)),
+        Codec::Bzip2 => Some(crate::bz2::opener(file)),
+    }
+}
+
+/// A decoder for the whole uncompressed stream of a compressed file, from
+/// its start (`None` for a plain tar).
+pub(crate) fn sequential_decoder(
+    codec: Codec,
+    file: &Arc<File>,
+) -> Result<Option<Box<dyn Decoder>>> {
+    let Some(open) = opener(codec, file) else {
+        return Ok(None);
+    };
+    Ok(Some(open(None, &|_| unreachable!("no checkpoint"))?))
+}
+
+pub(crate) fn detect(file: &mut File) -> Result<Codec> {
     let mut head = [0u8; 512];
     let mut n = 0;
     while n < head.len() {
@@ -400,21 +476,21 @@ fn build_index(
         Ok(match codec {
             Codec::Gzip => {
                 let mut reader = IndexingReader::new(file.clone(), spacing)?;
-                let members = {
-                    let mut r = GzProgress {
-                        inner: &mut reader,
-                        report: &mut report,
-                    };
-                    let members =
-                        Walker::new(ReadSource::new(&mut r)).collect::<Result<Vec<_>>>()?;
-                    // The walker stops at the tar terminator; decode the rest so
-                    // a damaged tail or a bad trailer CRC fails here, not later.
-                    std::io::copy(&mut r, &mut std::io::sink())?;
-                    members
-                };
-                (members, std::mem::take(&mut reader.checkpoints))
+                let members = walk_compressed(&mut reader, &mut report)?;
+                let size = reader.position();
+                (members, std::mem::take(&mut reader.checkpoints), size)
             }
-            _ => {
+            Codec::Zstd | Codec::Xz | Codec::Bzip2 => {
+                let dec = sequential_decoder(codec, file)?.expect("a compressed codec");
+                let mut reader = Indexer::new(dec, spacing);
+                let members = walk_compressed(&mut reader, &mut report)?;
+                let size = reader.position();
+                let mut points = std::mem::take(&mut reader.checkpoints);
+                // A frame ending with the data is no use to resume from.
+                points.retain(|c| c.uncompressed_offset < size);
+                (members, points, size)
+            }
+            Codec::None => {
                 let mut reader = file.try_clone()?;
                 reader.seek(SeekFrom::Start(0))?;
                 let counted = Counted {
@@ -423,14 +499,18 @@ fn build_index(
                     report: &mut report,
                 };
                 let src = SeekSource::new(std::io::BufReader::with_capacity(64 * 1024, counted))?;
-                (Walker::new(src).collect::<Result<Vec<_>>>()?, Vec::new())
+                (
+                    Walker::new(src).collect::<Result<Vec<_>>>()?,
+                    Vec::new(),
+                    key.size,
+                )
             }
         })
     })();
     if report.cancelled() {
         return Err(Error::Cancelled);
     }
-    let (members, checkpoints) = walked?;
+    let (members, checkpoints, stream_size) = walked?;
     report.done();
     if report.cancelled() {
         return Err(Error::Cancelled); // cancelled just as it finished
@@ -442,7 +522,37 @@ fn build_index(
         ));
     }
     let entries = build_tree(members);
-    Index::create(index_path, key, codec, &entries, &checkpoints)
+    Index::create(index_path, key, codec, stream_size, &entries, &checkpoints)
+}
+
+/// A decompressing reader used for indexing.
+trait Indexing: Read {
+    fn compressed_position(&self) -> u64;
+}
+
+impl Indexing for IndexingReader {
+    fn compressed_position(&self) -> u64 {
+        IndexingReader::compressed_position(self)
+    }
+}
+
+impl Indexing for Indexer {
+    fn compressed_position(&self) -> u64 {
+        Indexer::compressed_position(self)
+    }
+}
+
+/// Walks the tar stream an indexing reader decompresses.
+fn walk_compressed(reader: &mut dyn Indexing, report: &mut Reporter) -> Result<Vec<Entry>> {
+    let mut r = Progressed {
+        inner: reader,
+        report,
+    };
+    let members = Walker::new(ReadSource::new(&mut r)).collect::<Result<Vec<_>>>()?;
+    // The walker stops at the tar terminator; decode the rest so a damaged
+    // tail or a bad trailer checksum fails here, not later.
+    std::io::copy(&mut r, &mut std::io::sink())?;
+    Ok(members)
 }
 
 /// Passes indexing progress on, at most once per 1 MiB or 1% read.
@@ -489,13 +599,13 @@ impl Reporter<'_> {
     }
 }
 
-/// The gzip indexing reader, reporting how much compressed input it used.
-struct GzProgress<'a, 'b> {
-    inner: &'a mut IndexingReader,
+/// An indexing reader, reporting how much compressed input it used.
+struct Progressed<'a, 'b> {
+    inner: &'a mut dyn Indexing,
     report: &'a mut Reporter<'b>,
 }
 
-impl Read for GzProgress<'_, '_> {
+impl Read for Progressed<'_, '_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.report.at(self.inner.compressed_position())?;

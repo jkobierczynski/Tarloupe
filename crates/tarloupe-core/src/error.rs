@@ -13,12 +13,6 @@ pub enum Error {
     #[error("corrupt tar archive at offset {offset}: {reason}")]
     Corrupt { offset: u64, reason: String },
 
-    #[error("{codec} compressed archives are not supported yet (planned for {milestone})")]
-    UnsupportedCodec {
-        codec: &'static str,
-        milestone: &'static str,
-    },
-
     #[error("not a tar archive (no valid tar header found)")]
     NotTar,
 

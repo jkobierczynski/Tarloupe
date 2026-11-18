@@ -5,7 +5,9 @@
 //! - `entries`: one row per member in archive order, plus synthesised
 //!   parent directories. Lookups ignore superseded rows (last one wins).
 //! - `checkpoints`: decoder restart points for compressed streams (gzip:
-//!   bit offset plus the zlib-compressed 32 KiB window before it).
+//!   bit offset plus the zlib-compressed 32 KiB window before it; zstd and
+//!   bzip2: the byte offset of a frame or stream; xz: the byte offset of a
+//!   block plus the stream's check type).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -177,6 +179,7 @@ impl Index {
         path: &Path,
         key: &ArchiveKey,
         codec: Codec,
+        stream_size: u64,
         entries: &[Entry],
         checkpoints: &[Checkpoint],
     ) -> Result<Index> {
@@ -184,7 +187,7 @@ impl Index {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = unique_temp_path(path)?;
-        let result = Index::write(&tmp, key, codec, entries, checkpoints)
+        let result = Index::write(&tmp, key, codec, stream_size, entries, checkpoints)
             .and_then(|()| Ok(std::fs::rename(&tmp, path)?));
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -198,6 +201,7 @@ impl Index {
         tmp: &Path,
         key: &ArchiveKey,
         codec: Codec,
+        stream_size: u64,
         entries: &[Entry],
         checkpoints: &[Checkpoint],
     ) -> Result<()> {
@@ -222,6 +226,7 @@ impl Index {
                     ("entry_count", entries.len().to_string()),
                     ("member_count", members.to_string()),
                     ("checkpoint_count", checkpoints.len().to_string()),
+                    ("stream_size", stream_size.to_string()),
                     // Unique per build (the temp file was created
                     // exclusively), so two builds never look the same.
                     (
@@ -522,7 +527,7 @@ mod tests {
             mtime_ns: 1,
             sample_hash: 2,
         };
-        let idx = Index::create(&path, &key(10), Codec::None, &[], &[]).unwrap();
+        let idx = Index::create(&path, &key(10), Codec::None, 0, &[], &[]).unwrap();
         // Keep the only pooled connection busy, so the next query opens a
         // new one, then replace the file as a rebuild for another archive
         // would (where the platform allows replacing an open file).
@@ -531,7 +536,7 @@ mod tests {
         // its checkpoints could differ): neither may be mixed in.
         for size in [20, 10] {
             let busy = idx.conn().unwrap();
-            let replaced = Index::create(&path, &key(size), Codec::None, &[], &[]);
+            let replaced = Index::create(&path, &key(size), Codec::None, 0, &[], &[]);
             // Unix lets a rebuild rename over an open index, so the
             // replacement really happens there; Windows refuses it.
             #[cfg(unix)]
