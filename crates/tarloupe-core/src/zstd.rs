@@ -138,7 +138,8 @@ pub fn seek_table(frames: &[(u32, u32)]) -> Vec<u8> {
 
 /// Compresses `data` as one frame with a content checksum.
 pub fn compress_frame(data: &[u8], level: i32) -> io::Result<Vec<u8>> {
-    let mut cctx = zstd_safe::CCtx::create();
+    let mut cctx =
+        zstd_safe::CCtx::try_create().ok_or_else(|| io::Error::other("zstd: out of memory"))?;
     let err = |c| io::Error::other(format!("zstd: {}", get_error_name(c)));
     cctx.set_parameter(zstd_safe::CParameter::CompressionLevel(level))
         .map_err(err)?;

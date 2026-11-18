@@ -13,7 +13,7 @@ use crate::gzip::{self, IndexingReader};
 use crate::index::{build_tree, default_index_dir, Index};
 use crate::key::ArchiveKey;
 use crate::path::{normalize, resolve_link};
-use crate::stream::{Decoder, Indexer, Opener, Point, RandomReader};
+use crate::stream::{self, Decoder, Indexer, Opener, Point, RandomReader};
 use crate::walker::{ReadSource, SeekSource, Walker};
 
 /// Maximum symlink/hard-link hops when resolving an entry to its data.
@@ -110,7 +110,10 @@ impl Archive {
         }
 
         let (index, status) = if !opts.rebuild && index_path.exists() {
-            match Index::open(&index_path, &key) {
+            match Index::open(&index_path, &key).and_then(|i| {
+                load_points(&i, codec)?;
+                Ok(i)
+            }) {
                 Ok(i) => (i, IndexStatus::Loaded),
                 Err(e @ (Error::StaleIndex { .. } | Error::Sqlite(_))) if opts.require_index => {
                     return Err(e)
@@ -137,7 +140,7 @@ impl Archive {
 
         let (reader, points) = match opener(codec, &file) {
             Some(o) => {
-                let points = index.checkpoints()?;
+                let points = load_points(&index, codec)?;
                 (Some(RandomReader::new(points.clone(), o)), points)
             }
             None => (None, Vec::new()),
@@ -174,21 +177,28 @@ impl Archive {
         self.index.meta("stream_size").ok().flatten()?.parse().ok()
     }
 
-    /// The largest stretch of the uncompressed stream that has no restart
-    /// point: a read may have to decode up to this much first. Indexes from
-    /// 0.1 do not record the stream size, so the stretch after the last
-    /// restart point is unknown and left out for them.
+    /// The most a read may have to decode before it reaches its data: the
+    /// longest stretch without a restart point, plus the rest of the cache
+    /// chunk it ends in, since reads decode whole chunks. Indexes from 0.1
+    /// do not record the stream size, so the stretch after the last restart
+    /// point is unknown and left out for them: the result is then only the
+    /// longest known stretch.
     pub fn max_decode_distance(&self) -> u64 {
         if self.codec == Codec::None {
             return 0;
         }
+        let end = self.stream_size();
+        let reach = |next: u64| {
+            let chunk_end = (next / stream::CHUNK + 1) * stream::CHUNK;
+            end.map_or(chunk_end, |e| chunk_end.min(e.max(next)))
+        };
         let mut prev = 0;
         let mut gap = 0;
         for p in &self.points {
-            gap = gap.max(p.uncompressed_offset.saturating_sub(prev));
+            gap = gap.max(reach(p.uncompressed_offset).saturating_sub(prev));
             prev = p.uncompressed_offset;
         }
-        match self.stream_size() {
+        match end {
             Some(end) => gap.max(end.saturating_sub(prev)),
             None => gap,
         }
@@ -387,6 +397,19 @@ impl Archive {
 
 /// Reads with a longer decode distance than this are reported as slow.
 const SLOW_DISTANCE: u64 = 64 << 20;
+
+/// Loads the restart points, rejecting ones the codec cannot start at:
+/// only gzip resumes mid-byte.
+fn load_points(index: &Index, codec: Codec) -> Result<Vec<Point>> {
+    let points = index.checkpoints()?;
+    if codec != Codec::Gzip && points.iter().any(|p| p.bit_offset % 8 != 0) {
+        return Err(Error::StaleIndex {
+            path: index.path().display().to_string(),
+            reason: "checkpoint not on a byte boundary".into(),
+        });
+    }
+    Ok(points)
+}
 
 /// Makes decoders for a compressed codec.
 fn opener(codec: Codec, file: &Arc<File>) -> Option<Opener> {

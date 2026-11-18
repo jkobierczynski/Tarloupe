@@ -138,7 +138,10 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
     }
     let file = Arc::new(file);
     let source: Box<dyn Source> = match sequential_decoder(codec, &file)? {
-        Some(dec) => Box::new(DecoderSource(dec)),
+        Some(dec) => Box::new(DecoderSource {
+            dec,
+            cancel: opts.cancel.clone(),
+        }),
         None => {
             let mut plain = file.try_clone()?;
             plain.seek(SeekFrom::Start(0))?; // detecting read the first block
@@ -223,12 +226,10 @@ const MAX_THREADS: usize = 256;
 
 /// Creates a new, uniquely named file next to `output`.
 fn create_staging(output: &Path) -> Result<(PathBuf, File)> {
-    let base = output.file_name().unwrap_or_default().to_os_string();
+    // A short fixed name: a long output name must not push it past the
+    // file system's name limit.
     for i in 0..1000u32 {
-        let mut name = std::ffi::OsString::from(".");
-        name.push(&base);
-        name.push(format!(".{}-{i}.part", std::process::id()));
-        let path = output.with_file_name(name);
+        let path = output.with_file_name(format!(".tarloupe-{}-{i}.part", std::process::id()));
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -303,7 +304,10 @@ fn write_seekable_zstd(
             }
             handles
                 .into_iter()
-                .map(|h| h?.join().expect("compression thread panicked"))
+                .map(|h| {
+                    h?.join()
+                        .unwrap_or_else(|_| Err(io::Error::other("compression thread panicked")))
+                })
                 .collect()
         });
         for (data, frame) in batch.iter().zip(frames) {
@@ -338,7 +342,12 @@ trait Source: Read {
     fn consumed(&self) -> u64;
 }
 
-struct DecoderSource(Box<dyn Decoder>);
+struct DecoderSource {
+    dec: Box<dyn Decoder>,
+    /// Checked between steps: a long run of steps that produce nothing
+    /// (skippable frames, xz padding) never returns to the caller.
+    cancel: Option<Arc<AtomicBool>>,
+}
 
 impl Read for DecoderSource {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -346,7 +355,14 @@ impl Read for DecoderSource {
             return Ok(0);
         }
         loop {
-            let s = self.0.step(buf)?;
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed))
+            {
+                return Err(io::Error::other("conversion was cancelled"));
+            }
+            let s = self.dec.step(buf)?;
             if s.produced > 0 || !s.boundary {
                 return Ok(s.produced);
             }
@@ -356,7 +372,7 @@ impl Read for DecoderSource {
 
 impl Source for DecoderSource {
     fn consumed(&self) -> u64 {
-        self.0.compressed_position()
+        self.dec.compressed_position()
     }
 }
 

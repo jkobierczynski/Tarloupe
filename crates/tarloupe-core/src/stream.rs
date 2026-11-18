@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Decoded data is cached in aligned chunks of this size.
-const CHUNK: u64 = 1024 * 1024;
+pub(crate) const CHUNK: u64 = 1024 * 1024;
 /// Chunks kept in the cache (64 MiB).
 const CACHE_CHUNKS: usize = 64;
 /// Idle decoders kept for continuing sequential reads.

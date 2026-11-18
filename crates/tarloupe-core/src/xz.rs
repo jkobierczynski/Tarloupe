@@ -82,6 +82,12 @@ enum Phase {
     Done,
 }
 
+/// Running CRC32 and length of the index bytes read so far.
+struct Seen {
+    crc: u32,
+    len: u64,
+}
+
 pub(crate) struct XzDecoder {
     input: Input,
     strm: Stream,
@@ -173,23 +179,28 @@ impl XzDecoder {
         Ok(())
     }
 
-    /// Reads one index byte, keeping it for the index CRC.
-    fn byte(&mut self, seen: &mut Vec<u8>) -> io::Result<u8> {
+    /// Reads one index byte, folding it into the running index CRC.
+    fn byte(&mut self, seen: &mut Seen) -> io::Result<u8> {
         if !self.input.refill()? {
             return Err(invalid("truncated xz index"));
         }
         let b = self.input.data()[0];
         self.input.consume(1);
-        seen.push(b);
+        seen.crc = unsafe { lz::lzma_crc32(&b, 1, seen.crc) };
+        seen.len += 1;
         Ok(b)
     }
 
-    fn varint(&mut self, seen: &mut Vec<u8>) -> io::Result<u64> {
+    /// Reads a varint, rejecting non-minimal encodings as liblzma does.
+    fn varint(&mut self, seen: &mut Seen) -> io::Result<u64> {
         let mut v = 0u64;
         for i in 0..9 {
             let b = self.byte(seen)?;
             v |= ((b & 0x7f) as u64) << (7 * i);
             if b & 0x80 == 0 {
+                if b == 0 && i > 0 {
+                    break;
+                }
                 return Ok(v);
             }
         }
@@ -200,14 +211,14 @@ impl XzDecoder {
     /// The block records themselves are not needed: every block was (or,
     /// after a checkpoint, will be) verified by its own check.
     fn index(&mut self) -> io::Result<()> {
-        let mut seen = Vec::new();
+        let mut seen = Seen { crc: 0, len: 0 };
         self.byte(&mut seen)?;
         let records = self.varint(&mut seen)?;
         for _ in 0..records {
             self.varint(&mut seen)?;
             self.varint(&mut seen)?;
         }
-        let pad = (4 - seen.len() % 4) % 4;
+        let pad = ((4 - seen.len % 4) % 4) as usize;
         // Padding, the index CRC32, then the 12-byte footer.
         let rest = pad + 4 + 12;
         if self.input.fill(rest)? < rest {
@@ -216,9 +227,9 @@ impl XzDecoder {
         let d = &self.input.data()[..rest];
         let crc32 = |b: &[u8], init: u32| unsafe { lz::lzma_crc32(b.as_ptr(), b.len(), init) };
         let (padding, crc, footer) = (&d[..pad], &d[pad..pad + 4], &d[pad + 4..rest]);
-        let index_size = (seen.len() + pad + 4) as u64;
+        let index_size = seen.len + pad as u64 + 4;
         let backward = (u32::from_le_bytes(footer[4..8].try_into().unwrap()) as u64 + 1) * 4;
-        if padding.iter().any(|&b| b != 0) || crc32(padding, crc32(&seen, 0)).to_le_bytes() != crc {
+        if padding.iter().any(|&b| b != 0) || crc32(padding, seen.crc).to_le_bytes() != crc {
             return Err(invalid("corrupt xz index"));
         }
         if footer[10..12] != FOOTER_MAGIC

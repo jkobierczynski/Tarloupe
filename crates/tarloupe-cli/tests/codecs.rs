@@ -299,6 +299,18 @@ fn damaged_archives_are_errors() {
     }
 }
 
+/// CRC-32 (IEEE), as xz uses it.
+fn crc32(data: &[u8]) -> u32 {
+    let mut c = !0u32;
+    for &b in data {
+        c ^= b as u32;
+        for _ in 0..8 {
+            c = (c >> 1) ^ (0xEDB8_8320 & (c & 1).wrapping_neg());
+        }
+    }
+    !c
+}
+
 #[test]
 fn damaged_trailers_are_errors() {
     // The tar ends long before the compressed data, so only checking the
@@ -322,6 +334,11 @@ fn damaged_trailers_are_errors() {
     ] {
         let mut bad = xz.clone();
         bad[at] ^= 1;
+        if name == "backward-size" {
+            // Keep the footer CRC valid, so only the size check catches it.
+            let crc = crc32(&bad[n - 8..n - 2]);
+            bad[n - 12..n - 8].copy_from_slice(&crc.to_le_bytes());
+        }
         cases.push((name, bad));
     }
     // Another bzip2 stream starts, but is cut off after its magic.
@@ -426,4 +443,37 @@ fn default_output_names() {
     for (i, t, o) in cases {
         assert_eq!(default_output(Path::new(i), t), Path::new(o), "{i}");
     }
+}
+
+#[test]
+fn misaligned_checkpoints_rebuild_the_index() {
+    // zstd can only start at a byte, so a checkpoint mid-byte means the
+    // index is damaged: it is rebuilt, or refused when it must be used.
+    let dir = tempfile::tempdir().unwrap();
+    let idx = dir.path().join("idx");
+    let path = dir.path().join("f.tar.zst");
+    fs::write(&path, zstd_frames(&sample_tar(), 256 << 10)).unwrap();
+    let a = open(&path, &idx);
+    assert!(checkpoints(&a) > 0);
+    let index = a.index_path().to_path_buf();
+    drop(a);
+    let db = rusqlite::Connection::open(&index).unwrap();
+    db.execute(
+        "UPDATE checkpoints SET compressed_bit_offset = compressed_bit_offset + 3 \
+         WHERE uncompressed_offset = (SELECT MAX(uncompressed_offset) FROM checkpoints)",
+        [],
+    )
+    .unwrap();
+    drop(db);
+    let strict = OpenOptions {
+        index_dir: Some(idx.clone()),
+        require_index: true,
+        ..Default::default()
+    };
+    assert!(Archive::open(&path, &strict).is_err());
+    let a = open(&path, &idx);
+    assert_eq!(
+        a.index_status(),
+        tarloupe_core::archive::IndexStatus::Rebuilt
+    );
 }

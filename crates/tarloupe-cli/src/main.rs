@@ -194,8 +194,15 @@ fn warn_if_slow(a: &Archive) {
     if let Some(why) = a.slow_access() {
         // The path is not pasted into a command line: it may come from
         // someone else and contain shell syntax.
+        // Without the stream size (indexes from 0.1) only the known gaps
+        // are measured, so the figure is a lower bound.
+        let bound = if a.stream_size().is_some() {
+            "up to"
+        } else {
+            "at least"
+        };
         eprintln!(
-            "tarloupe: warning: {why}; a read can decode up to {} first. \
+            "tarloupe: warning: {why}; a read can decode {bound} {} first. \
              `tarloupe convert` on this archive makes a copy that reads fast.",
             human_size(a.max_decode_distance()),
         );

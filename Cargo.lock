@@ -824,6 +824,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "embed-resource",
+ "rusqlite",
  "tarloupe-core",
  "tarloupe-corpus",
  "tarloupe-winfsp",
