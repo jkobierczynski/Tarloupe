@@ -88,6 +88,7 @@ impl Archive {
         // Key and index come from the handle we keep for reads, so they
         // describe the same file even if the path is replaced meanwhile.
         let key = ArchiveKey::from_file(&file)?;
+        let file_size = file.metadata()?.len();
         let file = Arc::new(file);
         let spacing = opts
             .checkpoint_spacing
@@ -111,7 +112,7 @@ impl Archive {
 
         let (index, status) = if !opts.rebuild && index_path.exists() {
             match Index::open(&index_path, &key).and_then(|i| {
-                load_points(&i, codec)?;
+                load_points(&i, codec, file_size)?;
                 Ok(i)
             }) {
                 Ok(i) => (i, IndexStatus::Loaded),
@@ -140,7 +141,7 @@ impl Archive {
 
         let (reader, points) = match opener(codec, &file) {
             Some(o) => {
-                let points = load_points(&index, codec)?;
+                let points = load_points(&index, codec, file_size)?;
                 (Some(RandomReader::new(points.clone(), o)), points)
             }
             None => (None, Vec::new()),
@@ -188,9 +189,15 @@ impl Archive {
             return 0;
         }
         let end = self.stream_size();
+        // A read of the chunk that holds `next` (or ends at it, when `next`
+        // is chunk-aligned) starts at the restart point before `next`.
+        // Without the stream size, the stream is only known to reach the
+        // last restart point.
+        let known_end =
+            end.unwrap_or_else(|| self.points.last().map_or(0, |p| p.uncompressed_offset));
         let reach = |next: u64| {
-            let chunk_end = (next / stream::CHUNK + 1) * stream::CHUNK;
-            end.map_or(chunk_end, |e| chunk_end.min(e.max(next)))
+            let chunk_end = next.div_ceil(stream::CHUNK) * stream::CHUNK;
+            chunk_end.min(known_end.max(next))
         };
         let mut prev = 0;
         let mut gap = 0;
@@ -399,14 +406,22 @@ impl Archive {
 const SLOW_DISTANCE: u64 = 64 << 20;
 
 /// Loads the restart points, rejecting ones the codec cannot start at:
-/// only gzip resumes mid-byte.
-fn load_points(index: &Index, codec: Codec) -> Result<Vec<Point>> {
+/// past the end of the file, mid-byte (only gzip resumes there), or, for
+/// xz, without the one-byte check type it needs.
+fn load_points(index: &Index, codec: Codec, file_size: u64) -> Result<Vec<Point>> {
     let points = index.checkpoints()?;
+    let stale = |reason: &str| Error::StaleIndex {
+        path: index.path().display().to_string(),
+        reason: reason.into(),
+    };
+    if points.iter().any(|p| p.bit_offset / 8 >= file_size) {
+        return Err(stale("checkpoint past the end of the archive"));
+    }
     if codec != Codec::Gzip && points.iter().any(|p| p.bit_offset % 8 != 0) {
-        return Err(Error::StaleIndex {
-            path: index.path().display().to_string(),
-            reason: "checkpoint not on a byte boundary".into(),
-        });
+        return Err(stale("checkpoint not on a byte boundary"));
+    }
+    if codec == Codec::Xz && !points.is_empty() && index.checkpoint_state_len_differs(1)? {
+        return Err(stale("corrupt xz checkpoint"));
     }
     Ok(points)
 }

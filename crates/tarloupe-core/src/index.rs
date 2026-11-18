@@ -389,6 +389,16 @@ impl Index {
         )?)
     }
 
+    /// Whether some checkpoint's state is not exactly `len` bytes long.
+    pub fn checkpoint_state_len_differs(&self, len: usize) -> Result<bool> {
+        Ok(self.conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM checkpoints \
+             WHERE state IS NULL OR length(state) != ?1)",
+            [len as i64],
+            |r| r.get(0),
+        )?)
+    }
+
     pub fn meta(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn()?

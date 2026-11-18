@@ -229,7 +229,16 @@ fn create_staging(output: &Path) -> Result<(PathBuf, File)> {
     // A short fixed name: a long output name must not push it past the
     // file system's name limit.
     for i in 0..1000u32 {
-        let path = output.with_file_name(format!(".tarloupe-{}-{i}.part", std::process::id()));
+        let name = format!(".tarloupe-{}-{i}.part", std::process::id());
+        // Never the output itself (compared ignoring case for Windows).
+        if output
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(&name))
+        {
+            continue;
+        }
+        let path = output.with_file_name(name);
         match fs::OpenOptions::new()
             .write(true)
             .create_new(true)
