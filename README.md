@@ -181,6 +181,19 @@ here, and the cost does not grow with the archive size. The first index
 decodes the archive once (zlib-rs, single-threaded); a parallel first pass
 is M4.
 
+## Benchmark: zstd and xz from `tarloupe convert`
+
+A 1 GiB bulk corpus (6,882 members) on the same 4 vCPU Linux machine:
+
+| Step | seekable `.tar.zst` | multi-block `.tar.xz` |
+|---|---|---|
+| `tarloupe convert big.tar` (defaults, 4 threads) | 6.6 s (449 MiB) | 182 s (411 MiB) |
+| `tarloupe index` (first open, one pass) | 0.9 s | 16.6 s |
+| `tarloupe cat` of a file near the end | 0.016 s | 0.071 s |
+
+`-l 1` makes the zstd conversion 2.2 s for a 2% larger file. Reads cost
+at most one 8 MiB frame or block of decoding, whatever the archive size.
+
 ## Test corpus generator
 
 `tarloupe-corpus` writes deterministic archives for tests and benchmarks:
