@@ -43,3 +43,6 @@ embed-resource = "3"
 [dev-dependencies]
 tempfile.workspace = true
 tarloupe-corpus = { path = "../tarloupe-corpus" }
+zstd-safe = { version = "8", default-features = false, features = ["std"] }
+bzip2 = "0.6"
+rusqlite.workspace = true

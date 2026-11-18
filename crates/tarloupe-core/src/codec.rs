@@ -1,5 +1,4 @@
-//! Compression detection. M0 only reads plain tar; everything else is
-//! recognised so the user gets a clear message instead of "not a tar".
+//! Compression detection.
 
 use crate::header;
 
@@ -20,15 +19,6 @@ impl Codec {
             Codec::Bzip2 => "bzip2",
             Codec::Xz => "xz",
             Codec::Zstd => "zstd",
-        }
-    }
-
-    pub(crate) fn milestone(self) -> &'static str {
-        match self {
-            Codec::None => "M0",
-            Codec::Gzip => "M1",
-            Codec::Zstd | Codec::Xz => "M3",
-            Codec::Bzip2 => "M4",
         }
     }
 

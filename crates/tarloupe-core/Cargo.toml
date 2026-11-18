@@ -13,6 +13,9 @@ rusqlite.workspace = true
 xxhash-rust.workspace = true
 dirs.workspace = true
 libz-rs-sys.workspace = true
+zstd-safe = { version = "8", default-features = false, features = ["std"] }
+liblzma-sys = { version = "0.4", default-features = false, features = ["static", "parallel"] }
+bzip2 = "0.6"
 
 [dev-dependencies]
 tempfile.workspace = true

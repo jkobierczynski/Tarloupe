@@ -6,10 +6,10 @@ them. The first open builds a persistent seek index in one pass; every open
 after that is instant, and any file inside can be read without decompressing
 the archive from the start.
 
-> **Status: 0.1.0, milestone M2 done (Windows MVP).** Plain `.tar` and
-> `.tar.gz`, through a command-line tool, and on Windows as a read-only
-> drive from Explorer's "Browse with Tarloupe", with a tray icon and an
-> installer that brings WinFsp. xz/zstd/bzip2 come in M3. See the
+> **Status: milestone M3 done (all four codecs).** `.tar`, `.tar.gz`,
+> `.tar.xz`, `.tar.zst` and `.tar.bz2`, through a command-line tool, and on
+> Windows as a read-only drive from Explorer's "Browse with Tarloupe", with
+> a tray icon and an installer that brings WinFsp. See the
 > [roadmap](#roadmap) and the [releases](https://github.com/jkobierczynski/Tarloupe/releases).
 
 ## What works today
@@ -22,6 +22,7 @@ $ tarloupe list -v big.tar.gz       # same output as `tar -tvf` (times in UTC)
 $ tarloupe ls -l big.tar.gz some/dir   # browse one directory
 $ tarloupe cat big.tar.gz some/dir/file.txt > file.txt
 $ tarloupe extract big.tar.gz some/dir -C out   # extract a file or directory
+$ tarloupe convert slow.tar.xz      # make slow.tar.zst, which reads fast (see below)
 
 PS> tarloupe mount big.tar.gz               # Windows: next free drive, e.g. Z:
 PS> tarloupe mount big.tar.gz C:\mnt\big     # or a folder that does not exist yet
@@ -31,7 +32,8 @@ PS> tarloupe explorer install               # add "Browse with Tarloupe" to the 
 
 **Browse with Tarloupe.** The installer adds a right-click item for every
 user; without it, `tarloupe explorer install` adds the same
-item for `.tar`, `.tgz` and `.tar.gz` files, for the current user (no
+item for `.tar`, `.tar.gz`, `.tar.xz`, `.tar.zst` and `.tar.bz2` files
+(and `.tgz`, `.txz`, `.tzst`, `.tbz2`, `.tbz`), for the current user (no
 administrator rights; `tarloupe explorer uninstall` removes it). On
 Windows 11 it is under "Show more options" until the native menu entry
 arrives in M5. It runs `tarloupew.exe`, which must sit next to
@@ -88,6 +90,31 @@ point to; dangling links, devices and FIFOs are hidden.
   A file written as one single deflate block (zlib-ng/zlib-rs level 1 do
   this) has no restart points; it still works, but every read decodes from
   the start, and `tarloupe index` warns about it.
+* **zstd:** every frame starts fresh, so each frame boundary is a restart
+  point that costs nothing to store. Files written as many frames read
+  fast: the [seekable format](https://github.com/facebook/zstd/blob/dev/contrib/seekable_format/zstd_seekable_compression_format.md)
+  (its seek table is skipped like any skippable frame), `pzstd`, and
+  `tarloupe convert`. Plain `zstd` writes one single frame, which works
+  but reads from the start. Windows of up to 2 GiB (`--long=31`) are
+  accepted.
+* **xz:** every block starts fresh too. Multi-threaded `xz -T0` (24 MiB blocks at
+  the default preset), `pixz` and `tarloupe convert` write many blocks and
+  read fast; single-threaded `xz -T1` writes one block, which reads from
+  the start.
+  Concatenated streams, stream padding and every check type are supported,
+  and each block's check is verified.
+* **bzip2:** files made of many streams (`pbzip2`, `cat a.bz2 b.bz2`) restart
+  at each stream. Inside one stream (plain `bzip2`, `lbzip2`), jumping to a
+  block is M4, so for now those read from the start.
+* **Slow archives:** when some data can only be reached by decoding more
+  than 64 MiB, `tarloupe` says why after indexing and suggests `convert`.
+* **`tarloupe convert`** recompresses any archive Tarloupe reads into
+  seekable zstd (default, level 9, 8 MiB frames, compressed on every core)
+  or multi-block xz (`--to xz`, preset 6, 8 MiB blocks); the tar inside
+  stays byte for byte the same. The output goes next to the input
+  (`big.tar.gz` -> `big.tar.zst`) unless `-o` says otherwise; `--level`,
+  `--block-size` and `-T` tune it. Both formats are standard: `zstd -d`,
+  `xz -d`, `tar` and 7-Zip read them as usual.
 
 ## Correctness
 
@@ -108,6 +135,12 @@ archive with GNU tar and compares every file with what Tarloupe reads:
   reads per variant are compared with the same archive uncompressed, with
   restart points every 64 KiB so that reads cross many of them. Truncated
   and corrupted files must fail.
+* zstd, xz and bzip2 archives, the same way: one frame and many frames,
+  with and without a seek table; one block and many blocks; xz from
+  `xz -T` and two concatenated `xz` streams with padding and different
+  check types; one and many bzip2 streams, and `bzip2 -9` itself. Each must
+  have restart points exactly when its format allows them, and `convert`
+  must produce files that read the same.
 
 `tarloupe extract` writes regular files and directories only (symlinks,
 devices and FIFOs are skipped with a note), refuses member paths with `..`,
@@ -148,6 +181,19 @@ here, and the cost does not grow with the archive size. The first index
 decodes the archive once (zlib-rs, single-threaded); a parallel first pass
 is M4.
 
+## Benchmark: zstd and xz from `tarloupe convert`
+
+A 1 GiB bulk corpus (6,882 members) on the same 4 vCPU Linux machine:
+
+| Step | seekable `.tar.zst` | multi-block `.tar.xz` |
+|---|---|---|
+| `tarloupe convert big.tar` (defaults, 4 threads) | 6.6 s (449 MiB) | 182 s (411 MiB) |
+| `tarloupe index` (first open, one pass) | 0.9 s | 16.6 s |
+| `tarloupe cat` of a file near the end | 0.016 s | 0.071 s |
+
+`-l 1` makes the zstd conversion 2.2 s for a 2% larger file. Reads cost
+at most one 8 MiB frame or block of decoding, whatever the archive size.
+
 ## Test corpus generator
 
 `tarloupe-corpus` writes deterministic archives for tests and benchmarks:
@@ -166,8 +212,8 @@ partly random, so compressors behave realistically.
 
 | Crate | Purpose |
 |---|---|
-| `tarloupe-core` | Platform-neutral library: codec detection, tar walker, SQLite index, random-access reads. No Windows code, so it builds and benchmarks on Linux. |
-| `tarloupe-cli` | The `tarloupe` command: `index`, `list`, `ls`, `cat`, `extract`, `mount`, `browse`, `explorer`; and `tarloupew`, the console-less helper Explorer runs. |
+| `tarloupe-core` | Platform-neutral library: codecs (gzip, zstd, xz, bzip2), tar walker, SQLite index, random-access reads, conversion. No Windows code, so it builds and benchmarks on Linux. |
+| `tarloupe-cli` | The `tarloupe` command: `index`, `list`, `ls`, `cat`, `extract`, `convert`, `mount`, `browse`, `explorer`; and `tarloupew`, the console-less helper Explorer runs. |
 | `tarloupe-winfsp` | Read-only WinFsp file system over the core's Windows-shaped view (`tarloupe_core::vfs`). Empty on other platforms. |
 | `tarloupe-corpus` | Synthetic corpus generator and its standalone tar writer. |
 
@@ -180,7 +226,7 @@ partly random, so compressors behave realistically.
 | **M0** Foundations | Workspace, corpus generator, tar walker, `.tar` index, CLI. *(done)* |
 | **M1** gzip engine | Checkpoint index with saved deflate windows, random reads, chunk cache, benchmarks. *(done)* |
 | **M2** Windows MVP | WinFsp read-only mount, "Browse with Tarloupe" in Explorer, tray app, installer. *(done, 0.1.0)* |
-| M3 More codecs | Seekable/multi-frame zstd, multi-block xz, sequential fallback, `convert`. |
+| **M3** More codecs | Seekable/multi-frame zstd, multi-block xz, bzip2 (sequential, multi-stream), sequential fallback, `convert`. *(done)* |
 | M4 Speed | Parallel gzip first pass, parallel bzip2. |
 | M5 Native feel | Shell namespace extension, Windows 11 context menu. |
 | M6 Reach | Linux FUSE, ratarmount index import, nested archives. |
@@ -196,7 +242,8 @@ The comparison tests need GNU tar on `PATH` (`tar` on Linux, or `gtar`);
 they are skipped when it is missing.
 
 On Windows, building needs LLVM (`winget install LLVM.LLVM`, for the WinFsp
-bindings) and the MSVC toolchain. The mount test is skipped when WinFsp is
+bindings) and the MSVC toolchain (it also compiles the bundled zstd and
+liblzma C sources). The mount test is skipped when WinFsp is
 not installed, unless `TARLOUPE_REQUIRE_WINFSP=1`.
 
 ### Windows installer

@@ -193,7 +193,9 @@ fn explorer_item_installs_and_uninstalls() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    for ext in [".tar", ".tgz", ".gz"] {
+    for ext in [
+        ".tar", ".tgz", ".gz", ".txz", ".xz", ".tzst", ".zst", ".tbz2", ".tbz", ".bz2",
+    ] {
         let k =
             format!(r"HKCU\Software\Classes\SystemFileAssociations\{ext}\shell\Tarloupe.Browse");
         let q = query(&k);

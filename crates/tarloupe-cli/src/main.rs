@@ -92,6 +92,31 @@ enum Cmd {
         #[command(flatten)]
         idx: IndexOpts,
     },
+    /// Recompress an archive so that any file in it reads fast: seekable
+    /// zstd (default) or multi-block xz. The tar inside stays the same.
+    Convert {
+        archive: PathBuf,
+        /// Output file (default: next to the archive, e.g. big.tar.gz ->
+        /// big.tar.zst).
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "zstd")]
+        to: ConvertTo,
+        /// zstd level (1-22, default 9) or xz preset (0-9, default 6).
+        #[arg(short, long)]
+        level: Option<i32>,
+        /// Uncompressed size of each zstd frame or xz block, e.g. 8M
+        /// (default). Smaller makes reads faster and the file a bit larger.
+        #[arg(long, value_name = "SIZE", value_parser = parse_size)]
+        block_size: Option<u64>,
+        /// Compression threads (default: one per CPU).
+        #[arg(short = 'T', long, default_value_t = 0)]
+        threads: usize,
+        /// Replace the output file if it exists.
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Open the archive in an Explorer window (Windows, needs WinFsp). It is
     /// mounted on a free drive letter and unmounted once every window and
     /// file on it has been closed for the idle time. Running it again for
@@ -106,7 +131,8 @@ enum Cmd {
         no_window: bool,
     },
     /// Add or remove "Browse with Tarloupe" in Explorer's right-click menu
-    /// for .tar, .tgz and .tar.gz files (Windows, current user only).
+    /// for .tar, .tar.gz, .tar.xz, .tar.zst and .tar.bz2 files (and .tgz,
+    /// .txz, .tzst, .tbz2, .tbz) (Windows, current user only).
     Explorer {
         #[command(subcommand)]
         action: ExplorerAction,
@@ -121,6 +147,12 @@ enum Cmd {
         #[command(flatten)]
         idx: IndexOpts,
     },
+}
+
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum ConvertTo {
+    Zstd,
+    Xz,
 }
 
 #[derive(Subcommand)]
@@ -152,21 +184,44 @@ fn open(archive: &PathBuf, idx: &IndexOpts, rebuild: bool) -> Result<Archive> {
             start.elapsed(),
             a.index_path().display()
         );
-        let points: u64 = a
-            .index()
-            .meta("checkpoint_count")?
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
-        let size = fs::metadata(archive).map(|m| m.len()).unwrap_or(0);
-        if a.codec() == tarloupe_core::Codec::Gzip && points <= 1 && size > 32 << 20 {
-            eprintln!(
-                "tarloupe: warning: this gzip file is one huge deflate block (as some \
-                 fast compressors write), so every read decodes from the start. \
-                 Recompressing it with gzip or pigz makes reads fast."
-            );
-        }
+        warn_if_slow(&a);
     }
     Ok(a)
+}
+
+/// Explains why reads will be slow, and how to fix it.
+fn warn_if_slow(a: &Archive) {
+    if let Some(why) = a.slow_access() {
+        // The path is not pasted into a command line: it may come from
+        // someone else and contain shell syntax.
+        // Without the stream size (indexes from 0.1) only the known gaps
+        // are measured, so the figure is a lower bound.
+        let bound = if a.stream_size().is_some() {
+            "up to"
+        } else {
+            "at least"
+        };
+        eprintln!(
+            "tarloupe: warning: {why}; a read can decode {bound} {} first. \
+             `tarloupe convert` on this archive makes a copy that reads fast.",
+            human_size(a.max_decode_distance()),
+        );
+    }
+}
+
+fn human_size(n: u64) -> String {
+    let units = ["bytes", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u + 1 < units.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} bytes")
+    } else {
+        format!("{v:.1} {}", units[u])
+    }
 }
 
 mod extract;
@@ -341,6 +396,61 @@ fn run(cli: Cli) -> Result<()> {
                 a.copy_to(&e, &mut out)
                     .with_context(|| format!("{name}: cannot read"))?;
             }
+        }
+        Cmd::Convert {
+            archive,
+            output,
+            to,
+            level,
+            block_size,
+            threads,
+            force,
+        } => {
+            use tarloupe_core::convert::{self, ConvertOptions, Target};
+            let target = match to {
+                ConvertTo::Zstd => Target::Zstd,
+                ConvertTo::Xz => Target::Xz,
+            };
+            let output = output.unwrap_or_else(|| convert::default_output(&archive, target));
+            let start = Instant::now();
+            let progress: tarloupe_core::Progress = if io::IsTerminal::is_terminal(&io::stderr()) {
+                std::sync::Arc::new(|done, total| {
+                    eprint!("\rtarloupe: converting... {}%", done * 100 / total.max(1));
+                })
+            } else {
+                std::sync::Arc::new(|_, _| {})
+            };
+            let stats = convert::convert(
+                &archive,
+                &output,
+                &ConvertOptions {
+                    target,
+                    level,
+                    block_size: block_size.unwrap_or(convert::DEFAULT_BLOCK_SIZE),
+                    threads,
+                    overwrite: force,
+                    progress: Some(progress),
+                    cancel: None,
+                },
+            );
+            if io::IsTerminal::is_terminal(&io::stderr()) {
+                eprintln!();
+            }
+            let stats = stats.with_context(|| {
+                format!(
+                    "cannot convert {} to {}",
+                    archive.display(),
+                    output.display()
+                )
+            })?;
+            eprintln!(
+                "tarloupe: wrote {} ({} -> {}, tar {}) in {:.1?}",
+                output.display(),
+                human_size(stats.input_size),
+                human_size(stats.output_size),
+                human_size(stats.stream_size),
+                start.elapsed()
+            );
         }
         Cmd::Browse {
             archive,

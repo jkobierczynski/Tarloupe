@@ -335,7 +335,7 @@ fn browsing_follows_tar_semantics() {
 }
 
 #[test]
-fn compressed_archives_get_a_clear_message() {
+fn damaged_compressed_archives_name_their_codec() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.tar.xz");
     fs::write(&path, [0xfd, b'7', b'z', b'X', b'Z', 0, 0, 4]).unwrap();
@@ -346,7 +346,7 @@ fn compressed_archives_get_a_clear_message() {
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("xz") && err.contains("M3"), "{err}");
+    assert!(err.contains("not an xz stream"), "{err}");
 }
 
 #[test]

@@ -11,39 +11,20 @@
 //! Bytes after the last member that do not start a new member are ignored,
 //! as GNU gzip does.
 
-use std::collections::HashMap;
 use std::fs::File;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use libz_rs_sys as z;
+
+use crate::stream::{invalid, read_at, Decoder, Opener, Step};
+pub use crate::stream::{Checkpoint, Point};
 
 /// Size of the deflate history window.
 pub const WINDOW: usize = 32 * 1024;
 /// Default distance between checkpoints, in uncompressed bytes.
 pub const DEFAULT_SPACING: u64 = 8 * 1024 * 1024;
-/// Decoded data is cached in aligned chunks of this size.
-const CHUNK: u64 = 1024 * 1024;
-/// Chunks kept in the cache (64 MiB).
-const CACHE_CHUNKS: usize = 64;
-/// Idle decoders kept for continuing sequential reads.
-const POOL: usize = 8;
 const INPUT_BUF: usize = 128 * 1024;
-
-/// A decoder restart point.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Checkpoint {
-    /// Offset in the uncompressed stream.
-    pub uncompressed_offset: u64,
-    /// Position in the compressed file, in bits from its start.
-    pub bit_offset: u64,
-    /// The preceding window (up to 32 KiB), zlib-compressed.
-    pub window: Vec<u8>,
-}
-
-fn invalid(msg: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, msg.into())
-}
 
 /// Owns one zlib-rs inflate stream. Boxed because zlib keeps a pointer
 /// back to the stream structure.
@@ -160,13 +141,6 @@ pub(crate) struct GzDecoder {
     pos: u64,
 }
 
-/// Result of one decoding step.
-pub(crate) struct Step {
-    pub produced: usize,
-    /// The step ended on a block boundary where a checkpoint may be taken.
-    pub boundary: bool,
-}
-
 impl GzDecoder {
     /// A decoder at the start of the file.
     pub fn new(file: Arc<File>) -> io::Result<GzDecoder> {
@@ -213,10 +187,6 @@ impl GzDecoder {
         Ok(d)
     }
 
-    pub fn position(&self) -> u64 {
-        self.pos
-    }
-
     /// Bit position of the next unread compressed bit.
     fn bit_offset(&self) -> u64 {
         let byte = self.next_read - (self.in_end - self.in_start) as u64;
@@ -234,10 +204,20 @@ impl GzDecoder {
         self.next_read += n as u64;
         Ok(n > 0)
     }
+}
+
+impl Decoder for GzDecoder {
+    fn position(&self) -> u64 {
+        self.pos
+    }
+
+    fn compressed_position(&self) -> u64 {
+        self.next_read
+    }
 
     /// Decodes into `out` (which must not be empty). `produced == 0` with
     /// no boundary means the stream has ended.
-    pub fn step(&mut self, out: &mut [u8]) -> io::Result<Step> {
+    fn step(&mut self, out: &mut [u8]) -> io::Result<Step> {
         debug_assert!(!out.is_empty());
         loop {
             match self.phase {
@@ -326,46 +306,6 @@ impl GzDecoder {
             }
         }
     }
-
-    /// Fills `buf` completely unless the stream ends; returns bytes written.
-    pub fn read_full(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let mut n = 0;
-        while n < buf.len() {
-            let s = self.step(&mut buf[n..])?;
-            if s.produced == 0 && !s.boundary {
-                break;
-            }
-            n += s.produced;
-        }
-        Ok(n)
-    }
-
-    /// Decodes and discards up to `n` bytes; returns how many were skipped.
-    pub fn skip(&mut self, mut n: u64, scratch: &mut [u8]) -> io::Result<u64> {
-        let start = self.pos;
-        while n > 0 {
-            let want = (scratch.len() as u64).min(n) as usize;
-            let got = self.read_full(&mut scratch[..want])?;
-            if got == 0 {
-                break;
-            }
-            n -= got as u64;
-        }
-        Ok(self.pos - start)
-    }
-}
-
-fn read_at(file: &File, buf: &mut [u8], off: u64) -> io::Result<usize> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        file.read_at(buf, off)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt;
-        file.seek_read(buf, off)
-    }
 }
 
 /// Compresses a window for storage.
@@ -446,6 +386,11 @@ impl IndexingReader {
         self.dec.next_read
     }
 
+    /// Uncompressed bytes decoded so far.
+    pub fn position(&self) -> u64 {
+        self.dec.position()
+    }
+
     fn window(&self) -> Vec<u8> {
         if self.wrapped {
             let mut w = self.win[self.wpos..].to_vec();
@@ -497,162 +442,16 @@ impl io::Read for IndexingReader {
     }
 }
 
-/// A checkpoint as kept in memory (the window is loaded on demand).
-#[derive(Debug, Clone, Copy)]
-pub struct Point {
-    pub uncompressed_offset: u64,
-    pub bit_offset: u64,
-}
-
-/// Small LRU of decoded chunks.
-struct ChunkCache {
-    map: HashMap<u64, (Arc<[u8]>, u64)>,
-    tick: u64,
-}
-
-impl ChunkCache {
-    fn get(&mut self, k: u64) -> Option<Arc<[u8]>> {
-        self.tick += 1;
-        let t = self.tick;
-        self.map.get_mut(&k).map(|(v, used)| {
-            *used = t;
-            v.clone()
-        })
-    }
-    fn put(&mut self, k: u64, v: Arc<[u8]>) {
-        self.tick += 1;
-        if self.map.len() >= CACHE_CHUNKS && !self.map.contains_key(&k) {
-            if let Some(&old) = self.map.iter().min_by_key(|(_, (_, u))| *u).map(|(k, _)| k) {
-                self.map.remove(&old);
+/// Makes gzip decoders for a [`crate::stream::RandomReader`]; the state
+/// of a checkpoint is its packed window.
+pub(crate) fn opener(file: Arc<File>) -> Opener {
+    Box::new(move |cp, state| {
+        Ok(Box::new(match cp {
+            Some(p) => {
+                let w = unpack_window(&state(p.uncompressed_offset)?)?;
+                GzDecoder::at_checkpoint(file.clone(), p.uncompressed_offset, p.bit_offset, &w)?
             }
-        }
-        self.map.insert(k, (v, self.tick));
-    }
-}
-
-/// Random-access reader over a gzip file with a loaded checkpoint list.
-pub(crate) struct GzRandom {
-    file: Arc<File>,
-    points: Vec<Point>,
-    cache: Mutex<ChunkCache>,
-    /// Idle decoders, each positioned at a chunk boundary.
-    pool: Mutex<Vec<GzDecoder>>,
-}
-
-impl GzRandom {
-    pub fn new(file: Arc<File>, points: Vec<Point>) -> GzRandom {
-        GzRandom {
-            file,
-            points,
-            cache: Mutex::new(ChunkCache {
-                map: HashMap::new(),
-                tick: 0,
-            }),
-            pool: Mutex::new(Vec::new()),
-        }
-    }
-
-    /// Fills `buf` from uncompressed offset `off`; fails at end of data.
-    /// `window` loads the packed window of a checkpoint.
-    pub fn read_exact_at(
-        &self,
-        buf: &mut [u8],
-        off: u64,
-        window: &dyn Fn(u64) -> io::Result<Vec<u8>>,
-    ) -> io::Result<()> {
-        let mut done = 0usize;
-        while done < buf.len() {
-            let at = off + done as u64;
-            let idx = at / CHUNK;
-            let chunk = self.chunk(idx, window)?;
-            let from = (at - idx * CHUNK) as usize;
-            if from >= chunk.len() {
-                return Err(io::ErrorKind::UnexpectedEof.into());
-            }
-            let n = (chunk.len() - from).min(buf.len() - done);
-            buf[done..done + n].copy_from_slice(&chunk[from..from + n]);
-            done += n;
-        }
-        Ok(())
-    }
-
-    fn chunk(
-        &self,
-        idx: u64,
-        window: &dyn Fn(u64) -> io::Result<Vec<u8>>,
-    ) -> io::Result<Arc<[u8]>> {
-        if let Some(c) = self.cache.lock().unwrap().get(idx) {
-            return Ok(c);
-        }
-        let start = idx * CHUNK;
-        let cp = match self
-            .points
-            .partition_point(|p| p.uncompressed_offset <= start)
-        {
-            0 => None,
-            i => Some(self.points[i - 1]),
-        };
-        let cp_off = cp.map_or(0, |p| p.uncompressed_offset);
-        // Reuse an idle decoder between the checkpoint and the chunk.
-        let mut dec = {
-            let mut pool = self.pool.lock().unwrap();
-            let best = pool
-                .iter()
-                .enumerate()
-                .filter(|(_, d)| d.position() <= start && d.position() >= cp_off)
-                .max_by_key(|(_, d)| d.position())
-                .map(|(i, _)| i);
-            best.map(|i| pool.swap_remove(i))
-        };
-        if dec.is_none() {
-            dec = Some(match cp {
-                Some(p) => {
-                    let w = unpack_window(&window(p.uncompressed_offset)?)?;
-                    GzDecoder::at_checkpoint(
-                        self.file.clone(),
-                        p.uncompressed_offset,
-                        p.bit_offset,
-                        &w,
-                    )?
-                }
-                None => GzDecoder::new(self.file.clone())?,
-            });
-        }
-        let mut dec = dec.unwrap();
-        // Get to a chunk boundary, then decode whole chunks up to `idx`,
-        // caching each one on the way.
-        let mut result = None;
-        loop {
-            let pos = dec.position();
-            let cur = pos.div_ceil(CHUNK);
-            let boundary = cur * CHUNK;
-            if pos < boundary {
-                let mut scratch = vec![0u8; (boundary - pos) as usize];
-                if dec.skip(boundary - pos, &mut scratch)? < boundary - pos {
-                    break; // the stream ended before this chunk
-                }
-                continue;
-            }
-            let mut data = vec![0u8; CHUNK as usize];
-            let n = dec.read_full(&mut data)?;
-            data.truncate(n);
-            let data: Arc<[u8]> = data.into();
-            self.cache.lock().unwrap().put(cur, data.clone());
-            if cur == idx {
-                result = Some(data);
-                break;
-            }
-            if n < CHUNK as usize {
-                break;
-            }
-        }
-        if dec.position() % CHUNK == 0 {
-            let mut pool = self.pool.lock().unwrap();
-            if pool.len() >= POOL {
-                pool.remove(0);
-            }
-            pool.push(dec);
-        }
-        Ok(result.unwrap_or_else(|| Arc::from(Vec::new())))
-    }
+            None => GzDecoder::new(file.clone())?,
+        }))
+    })
 }

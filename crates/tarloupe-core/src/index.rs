@@ -5,7 +5,10 @@
 //! - `entries`: one row per member in archive order, plus synthesised
 //!   parent directories. Lookups ignore superseded rows (last one wins).
 //! - `checkpoints`: decoder restart points for compressed streams (gzip:
-//!   bit offset plus the zlib-compressed 32 KiB window before it).
+//!   bit offset plus the zlib-compressed 32 KiB window before it; zstd and
+//!   bzip2: the offset of a frame or stream; xz: the offset of a block plus
+//!   the stream's check type). Offsets are in bits for every codec; all but
+//!   gzip's are multiples of 8.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -177,6 +180,7 @@ impl Index {
         path: &Path,
         key: &ArchiveKey,
         codec: Codec,
+        stream_size: u64,
         entries: &[Entry],
         checkpoints: &[Checkpoint],
     ) -> Result<Index> {
@@ -184,7 +188,7 @@ impl Index {
             std::fs::create_dir_all(dir)?;
         }
         let tmp = unique_temp_path(path)?;
-        let result = Index::write(&tmp, key, codec, entries, checkpoints)
+        let result = Index::write(&tmp, key, codec, stream_size, entries, checkpoints)
             .and_then(|()| Ok(std::fs::rename(&tmp, path)?));
         if result.is_err() {
             let _ = std::fs::remove_file(&tmp);
@@ -198,6 +202,7 @@ impl Index {
         tmp: &Path,
         key: &ArchiveKey,
         codec: Codec,
+        stream_size: u64,
         entries: &[Entry],
         checkpoints: &[Checkpoint],
     ) -> Result<()> {
@@ -222,6 +227,7 @@ impl Index {
                     ("entry_count", entries.len().to_string()),
                     ("member_count", members.to_string()),
                     ("checkpoint_count", checkpoints.len().to_string()),
+                    ("stream_size", stream_size.to_string()),
                     // Unique per build (the temp file was created
                     // exclusively), so two builds never look the same.
                     (
@@ -356,13 +362,22 @@ impl Index {
             "SELECT uncompressed_offset, compressed_bit_offset FROM checkpoints \
              ORDER BY uncompressed_offset",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(Point {
-                uncompressed_offset: r.get::<_, i64>(0)? as u64,
-                bit_offset: r.get::<_, i64>(1)? as u64,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut points: Vec<Point> = Vec::new();
+        for row in rows {
+            let (u, b) = row?;
+            if u < 0 || b < 0 || points.last().is_some_and(|p| p.bit_offset > b as u64) {
+                return Err(Error::StaleIndex {
+                    path: self.path.display().to_string(),
+                    reason: "corrupt checkpoint table".into(),
+                });
+            }
+            points.push(Point {
+                uncompressed_offset: u as u64,
+                bit_offset: b as u64,
+            });
+        }
+        Ok(points)
     }
 
     /// The packed window stored with the checkpoint at `uncompressed_offset`.
@@ -371,6 +386,16 @@ impl Index {
             "SELECT state FROM checkpoints WHERE uncompressed_offset = ?1",
             [uncompressed_offset as i64],
             |r| Ok(r.get::<_, Option<Vec<u8>>>(0)?.unwrap_or_default()),
+        )?)
+    }
+
+    /// Whether some checkpoint's state is not exactly `len` bytes long.
+    pub fn checkpoint_state_len_differs(&self, len: usize) -> Result<bool> {
+        Ok(self.conn()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM checkpoints \
+             WHERE state IS NULL OR length(state) != ?1)",
+            [len as i64],
+            |r| r.get(0),
         )?)
     }
 
@@ -522,7 +547,7 @@ mod tests {
             mtime_ns: 1,
             sample_hash: 2,
         };
-        let idx = Index::create(&path, &key(10), Codec::None, &[], &[]).unwrap();
+        let idx = Index::create(&path, &key(10), Codec::None, 0, &[], &[]).unwrap();
         // Keep the only pooled connection busy, so the next query opens a
         // new one, then replace the file as a rebuild for another archive
         // would (where the platform allows replacing an open file).
@@ -531,7 +556,7 @@ mod tests {
         // its checkpoints could differ): neither may be mixed in.
         for size in [20, 10] {
             let busy = idx.conn().unwrap();
-            let replaced = Index::create(&path, &key(size), Codec::None, &[], &[]);
+            let replaced = Index::create(&path, &key(size), Codec::None, 0, &[], &[]);
             // Unix lets a rebuild rename over an open index, so the
             // replacement really happens there; Windows refuses it.
             #[cfg(unix)]
