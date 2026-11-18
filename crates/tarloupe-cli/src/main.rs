@@ -192,11 +192,12 @@ fn open(archive: &PathBuf, idx: &IndexOpts, rebuild: bool) -> Result<Archive> {
 /// Explains why reads will be slow, and how to fix it.
 fn warn_if_slow(a: &Archive) {
     if let Some(why) = a.slow_access() {
+        // The path is not pasted into a command line: it may come from
+        // someone else and contain shell syntax.
         eprintln!(
             "tarloupe: warning: {why}; a read can decode up to {} first. \
-             `tarloupe convert {}` makes a copy that reads fast.",
+             `tarloupe convert` on this archive makes a copy that reads fast.",
             human_size(a.max_decode_distance()),
-            quote_arg(a.path())
         );
     }
 }
@@ -213,18 +214,6 @@ fn human_size(n: u64) -> String {
         format!("{n} bytes")
     } else {
         format!("{v:.1} {}", units[u])
-    }
-}
-
-/// A path as it can be pasted into a shell.
-fn quote_arg(p: &std::path::Path) -> String {
-    let s = p.display().to_string();
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || "._-/\\:".contains(c))
-    {
-        s
-    } else {
-        format!("\"{s}\"")
     }
 }
 

@@ -135,8 +135,13 @@ impl Archive {
             )
         };
 
-        let points = index.checkpoints()?;
-        let reader = opener(codec, &file).map(|o| RandomReader::new(points.clone(), o));
+        let (reader, points) = match opener(codec, &file) {
+            Some(o) => {
+                let points = index.checkpoints()?;
+                (Some(RandomReader::new(points.clone(), o)), points)
+            }
+            None => (None, Vec::new()),
+        };
         Ok(Archive {
             path,
             file,
@@ -170,23 +175,23 @@ impl Archive {
     }
 
     /// The largest stretch of the uncompressed stream that has no restart
-    /// point: a read may have to decode up to this much first.
+    /// point: a read may have to decode up to this much first. Indexes from
+    /// 0.1 do not record the stream size, so the stretch after the last
+    /// restart point is unknown and left out for them.
     pub fn max_decode_distance(&self) -> u64 {
         if self.codec == Codec::None {
             return 0;
         }
-        // Indexes from 0.1 do not record the stream size; the compressed
-        // size is a lower bound for it.
-        let end = self
-            .stream_size()
-            .unwrap_or_else(|| std::fs::metadata(&self.path).map_or(0, |m| m.len()));
         let mut prev = 0;
         let mut gap = 0;
         for p in &self.points {
-            gap = gap.max(p.uncompressed_offset - prev);
+            gap = gap.max(p.uncompressed_offset.saturating_sub(prev));
             prev = p.uncompressed_offset;
         }
-        gap.max(end.saturating_sub(prev))
+        match self.stream_size() {
+            Some(end) => gap.max(end.saturating_sub(prev)),
+            None => gap,
+        }
     }
 
     /// Why reads from this archive are slow, when they are: some of its
@@ -194,6 +199,12 @@ impl Archive {
     pub fn slow_access(&self) -> Option<&'static str> {
         if self.max_decode_distance() <= SLOW_DISTANCE {
             return None;
+        }
+        if !self.points.is_empty() {
+            return Some(
+                "parts of this archive lie far from any point where decoding can \
+                 start, so reads there decode a long way first",
+            );
         }
         Some(match self.codec {
             Codec::None => return None,
@@ -482,7 +493,7 @@ fn build_index(
             }
             Codec::Zstd | Codec::Xz | Codec::Bzip2 => {
                 let dec = sequential_decoder(codec, file)?.expect("a compressed codec");
-                let mut reader = Indexer::new(dec, spacing);
+                let mut reader = Indexer::new(dec, spacing, opts.cancel.clone());
                 let members = walk_compressed(&mut reader, &mut report)?;
                 let size = reader.position();
                 let mut points = std::mem::take(&mut reader.checkpoints);

@@ -22,7 +22,7 @@ $ tarloupe list -v big.tar.gz       # same output as `tar -tvf` (times in UTC)
 $ tarloupe ls -l big.tar.gz some/dir   # browse one directory
 $ tarloupe cat big.tar.gz some/dir/file.txt > file.txt
 $ tarloupe extract big.tar.gz some/dir -C out   # extract a file or directory
-$ tarloupe convert slow.tar.xz      # make big.tar.zst, which reads fast (see below)
+$ tarloupe convert slow.tar.xz      # make slow.tar.zst, which reads fast (see below)
 
 PS> tarloupe mount big.tar.gz               # Windows: next free drive, e.g. Z:
 PS> tarloupe mount big.tar.gz C:\mnt\big     # or a folder that does not exist yet

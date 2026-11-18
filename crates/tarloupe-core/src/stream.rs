@@ -13,6 +13,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Decoded data is cached in aligned chunks of this size.
@@ -111,13 +112,15 @@ pub(crate) struct Indexer {
     pending: std::ops::Range<usize>,
     spacing: u64,
     last: u64,
+    cancel: Option<Arc<AtomicBool>>,
     pub checkpoints: Vec<Checkpoint>,
 }
 
 impl Indexer {
-    pub fn new(dec: Box<dyn Decoder>, spacing: u64) -> Indexer {
+    pub fn new(dec: Box<dyn Decoder>, spacing: u64, cancel: Option<Arc<AtomicBool>>) -> Indexer {
         Indexer {
             dec,
+            cancel,
             buf: vec![0u8; 256 * 1024].into_boxed_slice(),
             pending: 0..0,
             spacing: spacing.max(1),
@@ -142,6 +145,15 @@ impl io::Read for Indexer {
             return Ok(0);
         }
         while self.pending.is_empty() {
+            // Steps that only pass frames without data do not return to
+            // the caller, so cancelling is checked here too.
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed))
+            {
+                return Err(io::Error::other("indexing was cancelled"));
+            }
             let s = self.dec.step(&mut self.buf)?;
             self.pending = 0..s.produced;
             if s.boundary {

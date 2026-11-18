@@ -86,11 +86,9 @@ pub struct ConvertStats {
 /// The name an archive gets when converted next to itself:
 /// `big.tar.gz` or `big.tgz` becomes `big.tar.zst`.
 pub fn default_output(input: &Path, target: Target) -> PathBuf {
-    let name = input
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let lower = name.to_ascii_lowercase();
+    let name = input.file_name().unwrap_or_default();
+    let bytes = name.as_encoded_bytes();
+    let lower = bytes.to_ascii_lowercase();
     let stem_len = [
         ".tar.gz",
         ".tar.bz2",
@@ -105,13 +103,17 @@ pub fn default_output(input: &Path, target: Target) -> PathBuf {
         ".tar",
     ]
     .iter()
-    .find(|ext| lower.ends_with(*ext))
-    .map_or(name.len(), |ext| name.len() - ext.len());
-    let mut out = name[..stem_len].to_string();
-    out.push_str(target.extension());
-    if out.eq_ignore_ascii_case(&name) {
+    .find(|ext| lower.ends_with(ext.as_bytes()))
+    .map_or(bytes.len(), |ext| bytes.len() - ext.len());
+    // Cutting an ASCII suffix keeps the rest a valid encoded string.
+    let stem = unsafe { std::ffi::OsStr::from_encoded_bytes_unchecked(&bytes[..stem_len]) };
+    let mut out = stem.to_os_string();
+    out.push(target.extension());
+    if out.as_encoded_bytes().eq_ignore_ascii_case(bytes) {
         // Same format already: do not collide with the input.
-        out = format!("{}.seekable{}", &name[..stem_len], target.extension());
+        out = stem.to_os_string();
+        out.push(".seekable");
+        out.push(target.extension());
     }
     input.with_file_name(out)
 }
@@ -158,19 +160,15 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
         p(0, input_size);
     }
 
-    // Written next to the output, then renamed into place.
-    let part = {
-        let mut name = output.file_name().unwrap_or_default().to_os_string();
-        name.push(".part");
-        output.with_file_name(name)
-    };
+    let threads = match opts.threads {
+        0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+        n => n,
+    }
+    .min(MAX_THREADS);
+    // Written next to the output under a name of our own, then moved into place.
+    let (part, out) = create_staging(output)?;
     let result = (|| -> Result<u64> {
-        let out = File::create(&part)?;
         let mut w = io::BufWriter::with_capacity(1 << 20, out);
-        let threads = match opts.threads {
-            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
-            n => n,
-        };
         let block = opts.block_size.clamp(64 << 10, 1 << 30);
         let level = opts.level.unwrap_or(opts.target.default_level());
         match opts.target {
@@ -180,7 +178,7 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
                 &mut w,
                 level.clamp(0, 9) as u32,
                 block,
-                threads as u32,
+                threads as u32, // at most MAX_THREADS
             )
             .map_err(|e| {
                 if src.cancelled() {
@@ -195,18 +193,19 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
         Ok(out.metadata()?.len())
     })();
     let output_size = match result {
+        Ok(_) if src.cancelled() => {
+            let _ = fs::remove_file(&part);
+            return Err(Error::Cancelled);
+        }
         Ok(n) => n,
         Err(e) => {
             let _ = fs::remove_file(&part);
             return Err(if src.cancelled() { Error::Cancelled } else { e });
         }
     };
-    if opts.overwrite {
-        let _ = fs::remove_file(output);
-    }
-    if let Err(e) = fs::rename(&part, output) {
+    if let Err(e) = publish(&part, output, opts.overwrite) {
         let _ = fs::remove_file(&part);
-        return Err(e.into());
+        return Err(e);
     }
     if let Some(p) = &opts.progress {
         p(input_size, input_size);
@@ -217,6 +216,56 @@ pub fn convert(input: &Path, output: &Path, opts: &ConvertOptions) -> Result<Con
         stream_size: src.read,
         output_size,
     })
+}
+
+/// More compression threads than this are not useful and only cost memory.
+const MAX_THREADS: usize = 256;
+
+/// Creates a new, uniquely named file next to `output`.
+fn create_staging(output: &Path) -> Result<(PathBuf, File)> {
+    let base = output.file_name().unwrap_or_default().to_os_string();
+    for i in 0..1000u32 {
+        let mut name = std::ffi::OsString::from(".");
+        name.push(&base);
+        name.push(format!(".{}-{i}.part", std::process::id()));
+        let path = output.with_file_name(name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(f) => return Ok((path, f)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(Error::Unsupported(format!(
+        "cannot create a temporary file next to {}",
+        output.display()
+    )))
+}
+
+/// Moves the finished file into place. Without `overwrite`, an output that
+/// appeared meanwhile is never replaced.
+fn publish(part: &Path, output: &Path, overwrite: bool) -> Result<()> {
+    if overwrite {
+        // Replaces the old output in one step (on Windows too).
+        fs::rename(part, output)?;
+        return Ok(());
+    }
+    match fs::hard_link(part, output) {
+        Ok(()) => {
+            let _ = fs::remove_file(part);
+            Ok(())
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Err(Error::Unsupported(format!(
+            "{} already exists",
+            output.display()
+        ))),
+        // File systems without hard links (FAT, some network shares).
+        Err(_) if !output.exists() => Ok(fs::rename(part, output)?),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Compresses frames of `block` bytes on `threads` threads, in order,
@@ -242,13 +291,19 @@ fn write_seekable_zstd(
             }
         }
         let frames: Vec<io::Result<Vec<u8>>> = std::thread::scope(|s| {
-            let handles: Vec<_> = batch
-                .iter()
-                .map(|data| s.spawn(move || crate::zstd::compress_frame(data, level)))
-                .collect();
+            let mut handles = Vec::with_capacity(batch.len());
+            for data in &batch {
+                let h = std::thread::Builder::new()
+                    .spawn_scoped(s, move || crate::zstd::compress_frame(data, level));
+                match h {
+                    Ok(h) => handles.push(Ok(h)),
+                    // Started threads are joined when the scope ends.
+                    Err(e) => handles.push(Err(e)),
+                }
+            }
             handles
                 .into_iter()
-                .map(|h| h.join().expect("compression thread panicked"))
+                .map(|h| h?.join().expect("compression thread panicked"))
                 .collect()
         });
         for (data, frame) in batch.iter().zip(frames) {

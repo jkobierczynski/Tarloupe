@@ -163,7 +163,7 @@ fn every_codec_reads_like_the_plain_tar() {
         ),
         (
             "zstd-seekable-one-frame",
-            converted(&tar_path, Target::Zstd, 1 << 30, 1),
+            converted(&tar_path, Target::Zstd, 32 << 20, 1),
             Codec::Zstd,
             false,
         ),
@@ -175,7 +175,7 @@ fn every_codec_reads_like_the_plain_tar() {
         ),
         (
             "xz-one-block",
-            converted(&tar_path, Target::Xz, 1 << 30, 1),
+            converted(&tar_path, Target::Xz, 32 << 20, 1),
             Codec::Xz,
             false,
         ),
@@ -300,6 +300,48 @@ fn damaged_archives_are_errors() {
 }
 
 #[test]
+fn damaged_trailers_are_errors() {
+    // The tar ends long before the compressed data, so only checking the
+    // trailers finds this damage.
+    let dir = tempfile::tempdir().unwrap();
+    let mut tar = Vec::new();
+    write_edge(&mut tar, Format::Gnu).unwrap();
+    let tar_path = dir.path().join("e.tar");
+    fs::write(&tar_path, &tar).unwrap();
+    let opts = OpenOptions {
+        index_dir: Some(dir.path().join("idx")),
+        ..Default::default()
+    };
+    let xz = converted(&tar_path, Target::Xz, 1 << 20, 1);
+    let n = xz.len();
+    let mut cases = Vec::new();
+    for (name, at) in [
+        ("footer-crc", n - 12),
+        ("backward-size", n - 7),
+        ("index-crc", n - 13),
+    ] {
+        let mut bad = xz.clone();
+        bad[at] ^= 1;
+        cases.push((name, bad));
+    }
+    // Another bzip2 stream starts, but is cut off after its magic.
+    let mut bz = bzip2_streams(&tar, usize::MAX);
+    bz.extend(b"BZh");
+    cases.push(("bzip2-cut", bz));
+    for (name, data) in cases {
+        let path = dir.path().join(format!("{name}.tar.x"));
+        fs::write(&path, data).unwrap();
+        assert!(Archive::open(&path, &opts).is_err(), "{name} must fail");
+    }
+    // Unrelated bytes after the last bzip2 stream are ignored, like bzip2 does.
+    let mut bz = bzip2_streams(&tar, usize::MAX);
+    bz.extend(b"garbage!");
+    let path = dir.path().join("bz-garbage.tar.bz2");
+    fs::write(&path, bz).unwrap();
+    Archive::open(&path, &opts).unwrap();
+}
+
+#[test]
 fn convert_command_makes_a_fast_copy() {
     let dir = tempfile::tempdir().unwrap();
     let idx = dir.path().join("idx");
@@ -367,7 +409,7 @@ fn convert_command_makes_a_fast_copy() {
 fn converted_bytes_xz_single(tar: &[u8], dir: &Path) -> Vec<u8> {
     let p = dir.join("single-src.tar");
     fs::write(&p, tar).unwrap();
-    converted(&p, Target::Xz, 1 << 30, 1)
+    converted(&p, Target::Xz, 32 << 20, 1)
 }
 
 #[test]

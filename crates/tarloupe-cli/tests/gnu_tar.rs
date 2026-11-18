@@ -346,7 +346,7 @@ fn damaged_compressed_archives_name_their_codec() {
         .unwrap();
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("xz"), "{err}");
+    assert!(err.contains("not an xz stream"), "{err}");
 }
 
 #[test]

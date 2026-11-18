@@ -6,8 +6,9 @@
 //!   parent directories. Lookups ignore superseded rows (last one wins).
 //! - `checkpoints`: decoder restart points for compressed streams (gzip:
 //!   bit offset plus the zlib-compressed 32 KiB window before it; zstd and
-//!   bzip2: the byte offset of a frame or stream; xz: the byte offset of a
-//!   block plus the stream's check type).
+//!   bzip2: the offset of a frame or stream; xz: the offset of a block plus
+//!   the stream's check type). Offsets are in bits for every codec; all but
+//!   gzip's are multiples of 8.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -361,13 +362,22 @@ impl Index {
             "SELECT uncompressed_offset, compressed_bit_offset FROM checkpoints \
              ORDER BY uncompressed_offset",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(Point {
-                uncompressed_offset: r.get::<_, i64>(0)? as u64,
-                bit_offset: r.get::<_, i64>(1)? as u64,
-            })
-        })?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?;
+        let mut points: Vec<Point> = Vec::new();
+        for row in rows {
+            let (u, b) = row?;
+            if u < 0 || b < 0 || points.last().is_some_and(|p| p.bit_offset > b as u64) {
+                return Err(Error::StaleIndex {
+                    path: self.path.display().to_string(),
+                    reason: "corrupt checkpoint table".into(),
+                });
+            }
+            points.push(Point {
+                uncompressed_offset: u as u64,
+                bit_offset: b as u64,
+            });
+        }
+        Ok(points)
     }
 
     /// The packed window stored with the checkpoint at `uncompressed_offset`.

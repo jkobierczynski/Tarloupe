@@ -72,9 +72,17 @@ impl Decoder for Bz2Decoder {
                 }
                 Phase::Between { first, announced } => {
                     self.input.fill(4)?;
-                    if !is_stream_start(self.input.data()) {
+                    let d = self.input.data();
+                    if !is_stream_start(d) {
                         if first {
                             return Err(invalid("not a bzip2 stream"));
+                        }
+                        // The start of another stream, cut off.
+                        if !d.is_empty()
+                            && d.len() < 4
+                            && b"BZh"[..d.len().min(3)] == d[..d.len().min(3)]
+                        {
+                            return Err(invalid("unexpected end of bzip2 data"));
                         }
                         self.phase = Phase::Done;
                         continue;

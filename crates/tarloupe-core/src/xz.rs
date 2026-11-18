@@ -173,19 +173,21 @@ impl XzDecoder {
         Ok(())
     }
 
-    fn byte(&mut self) -> io::Result<u8> {
+    /// Reads one index byte, keeping it for the index CRC.
+    fn byte(&mut self, seen: &mut Vec<u8>) -> io::Result<u8> {
         if !self.input.refill()? {
             return Err(invalid("truncated xz index"));
         }
         let b = self.input.data()[0];
         self.input.consume(1);
+        seen.push(b);
         Ok(b)
     }
 
-    fn varint(&mut self) -> io::Result<u64> {
+    fn varint(&mut self, seen: &mut Vec<u8>) -> io::Result<u64> {
         let mut v = 0u64;
         for i in 0..9 {
-            let b = self.byte()?;
+            let b = self.byte(seen)?;
             v |= ((b & 0x7f) as u64) << (7 * i);
             if b & 0x80 == 0 {
                 return Ok(v);
@@ -194,23 +196,37 @@ impl XzDecoder {
         Err(invalid("corrupt xz index"))
     }
 
-    /// Skips the index (its indicator byte is next) and the stream footer.
+    /// Checks the index (its indicator byte is next) and the stream footer.
+    /// The block records themselves are not needed: every block was (or,
+    /// after a checkpoint, will be) verified by its own check.
     fn index(&mut self) -> io::Result<()> {
-        let start = self.input.offset();
-        self.byte()?;
-        let records = self.varint()?;
+        let mut seen = Vec::new();
+        self.byte(&mut seen)?;
+        let records = self.varint(&mut seen)?;
         for _ in 0..records {
-            self.varint()?;
-            self.varint()?;
+            self.varint(&mut seen)?;
+            self.varint(&mut seen)?;
         }
-        let pad = (4 - (self.input.offset() - start) % 4) % 4;
+        let pad = (4 - seen.len() % 4) % 4;
         // Padding, the index CRC32, then the 12-byte footer.
-        let rest = pad as usize + 4 + 12;
+        let rest = pad + 4 + 12;
         if self.input.fill(rest)? < rest {
             return Err(invalid("truncated xz stream footer"));
         }
-        let footer = &self.input.data()[rest - 12..rest];
-        if footer[10..12] != FOOTER_MAGIC {
+        let d = &self.input.data()[..rest];
+        let crc32 = |b: &[u8], init: u32| unsafe { lz::lzma_crc32(b.as_ptr(), b.len(), init) };
+        let (padding, crc, footer) = (&d[..pad], &d[pad..pad + 4], &d[pad + 4..rest]);
+        let index_size = (seen.len() + pad + 4) as u64;
+        let backward = (u32::from_le_bytes(footer[4..8].try_into().unwrap()) as u64 + 1) * 4;
+        if padding.iter().any(|&b| b != 0) || crc32(padding, crc32(&seen, 0)).to_le_bytes() != crc {
+            return Err(invalid("corrupt xz index"));
+        }
+        if footer[10..12] != FOOTER_MAGIC
+            || crc32(&footer[4..10], 0).to_le_bytes() != footer[..4]
+            || backward != index_size
+            || footer[8] != 0
+            || footer[9] as u32 != self.check
+        {
             return Err(invalid("corrupt xz stream footer"));
         }
         self.input.consume(rest);
