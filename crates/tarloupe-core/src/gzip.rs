@@ -28,7 +28,7 @@ const INPUT_BUF: usize = 128 * 1024;
 
 /// Owns one zlib-rs inflate stream. Boxed because zlib keeps a pointer
 /// back to the stream structure.
-struct Inflater {
+pub(crate) struct Inflater {
     strm: Box<z::z_stream>,
 }
 
@@ -37,7 +37,7 @@ unsafe impl Send for Inflater {}
 
 impl Inflater {
     /// `window_bits` is -15 for raw deflate or 31 for a gzip member.
-    fn new(window_bits: i32) -> io::Result<Inflater> {
+    pub(crate) fn new(window_bits: i32) -> io::Result<Inflater> {
         let mut strm = Box::new(z::z_stream::default());
         let ret = unsafe {
             z::inflateInit2_(
@@ -53,21 +53,21 @@ impl Inflater {
         Ok(Inflater { strm })
     }
 
-    fn reset(&mut self, window_bits: i32) -> io::Result<()> {
+    pub(crate) fn reset(&mut self, window_bits: i32) -> io::Result<()> {
         match unsafe { z::inflateReset2(&mut *self.strm, window_bits) } {
             z::Z_OK => Ok(()),
             ret => Err(io::Error::other(format!("inflateReset2 failed ({ret})"))),
         }
     }
 
-    fn prime(&mut self, bits: i32, value: i32) -> io::Result<()> {
+    pub(crate) fn prime(&mut self, bits: i32, value: i32) -> io::Result<()> {
         match unsafe { z::inflatePrime(&mut *self.strm, bits, value) } {
             z::Z_OK => Ok(()),
             ret => Err(io::Error::other(format!("inflatePrime failed ({ret})"))),
         }
     }
 
-    fn set_dictionary(&mut self, dict: &[u8]) -> io::Result<()> {
+    pub(crate) fn set_dictionary(&mut self, dict: &[u8]) -> io::Result<()> {
         match unsafe {
             z::inflateSetDictionary(&mut *self.strm, dict.as_ptr(), dict.len() as z::uInt)
         } {
@@ -79,22 +79,39 @@ impl Inflater {
     }
 
     /// One `inflate(Z_BLOCK)` call. Returns (consumed, produced, code).
-    fn inflate(&mut self, input: &[u8], output: &mut [u8]) -> (usize, usize, i32) {
+    pub(crate) fn inflate(&mut self, input: &[u8], output: &mut [u8]) -> (usize, usize, i32) {
+        // SAFETY: initialized bytes are valid `MaybeUninit` bytes.
+        let output = unsafe {
+            std::slice::from_raw_parts_mut(
+                output.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>,
+                output.len(),
+            )
+        };
+        self.inflate_uninit(input, output)
+    }
+
+    /// Like [`Inflater::inflate`], into memory that need not be initialized
+    /// (zlib only writes the bytes it reports as produced).
+    pub(crate) fn inflate_uninit(
+        &mut self,
+        input: &[u8],
+        output: &mut [std::mem::MaybeUninit<u8>],
+    ) -> (usize, usize, i32) {
         let s = &mut *self.strm;
         s.next_in = input.as_ptr();
         s.avail_in = input.len().min(u32::MAX as usize) as z::uInt;
-        s.next_out = output.as_mut_ptr();
+        s.next_out = output.as_mut_ptr() as *mut u8;
         s.avail_out = output.len().min(u32::MAX as usize) as z::uInt;
         let (ai, ao) = (s.avail_in as usize, s.avail_out as usize);
         let ret = unsafe { z::inflate(s, z::Z_BLOCK) };
         (ai - s.avail_in as usize, ao - s.avail_out as usize, ret)
     }
 
-    fn data_type(&self) -> i32 {
+    pub(crate) fn data_type(&self) -> i32 {
         self.strm.data_type
     }
 
-    fn message(&self) -> String {
+    pub(crate) fn message(&self) -> String {
         if self.strm.msg.is_null() {
             "invalid compressed data".into()
         } else {
@@ -112,6 +129,10 @@ impl Drop for Inflater {
         }
     }
 }
+
+/// Where a member ended, and its trailer's CRC-32 and size when they are
+/// still to be checked.
+pub(crate) type MemberEnd = (u64, Option<(u32, u32)>);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -139,6 +160,11 @@ pub(crate) struct GzDecoder {
     phase: Phase,
     /// Uncompressed bytes produced so far (absolute stream offset).
     pos: u64,
+    /// Members ended so far: where, and the trailer's CRC-32 and size when
+    /// it was skipped unchecked (raw mode); `None` when zlib checked it.
+    /// Only kept when set to `Some` (by the parallel indexer).
+    pub(crate) members: Option<Vec<MemberEnd>>,
+    trailer: [u8; 8],
 }
 
 impl GzDecoder {
@@ -153,6 +179,8 @@ impl GzDecoder {
             inf: Inflater::new(31)?,
             phase: Phase::Stream { raw: false },
             pos: 0,
+            members: None,
+            trailer: [0; 8],
         })
     }
 
@@ -172,6 +200,8 @@ impl GzDecoder {
             inf: Inflater::new(-15)?,
             phase: Phase::Stream { raw: true },
             pos: uncompressed_offset,
+            members: None,
+            trailer: [0; 8],
         };
         let skip = (bit_offset % 8) as i32;
         if skip != 0 {
@@ -188,7 +218,7 @@ impl GzDecoder {
     }
 
     /// Bit position of the next unread compressed bit.
-    fn bit_offset(&self) -> u64 {
+    pub(crate) fn bit_offset(&self) -> u64 {
         let byte = self.next_read - (self.in_end - self.in_start) as u64;
         byte * 8 - (self.inf.data_type() & 7) as u64
     }
@@ -232,9 +262,24 @@ impl Decoder for GzDecoder {
                         return Err(invalid("truncated gzip member trailer"));
                     }
                     let k = (left as usize).min(self.in_end - self.in_start);
+                    let at = 8 - left as usize;
+                    self.trailer[at..at + k]
+                        .copy_from_slice(&self.inbuf[self.in_start..self.in_start + k]);
                     self.in_start += k;
                     self.phase = match left as usize - k {
-                        0 => Phase::NextMember,
+                        0 => {
+                            let t = self.trailer;
+                            if let Some(m) = &mut self.members {
+                                m.push((
+                                    self.pos,
+                                    Some((
+                                        u32::from_le_bytes(t[..4].try_into().unwrap()),
+                                        u32::from_le_bytes(t[4..].try_into().unwrap()),
+                                    )),
+                                ));
+                            }
+                            Phase::NextMember
+                        }
                         rest => Phase::Trailer(rest as u8),
                     };
                 }
@@ -281,6 +326,9 @@ impl Decoder for GzDecoder {
                             self.phase = if raw {
                                 Phase::Trailer(8)
                             } else {
+                                if let Some(m) = &mut self.members {
+                                    m.push((self.pos, None));
+                                }
                                 Phase::NextMember
                             };
                             if produced > 0 {
