@@ -467,6 +467,8 @@ pub(crate) fn opener(file: Arc<File>) -> Opener {
 
 /// Compressed bytes per work item.
 const CHUNK_BYTES: u64 = 2 << 20;
+/// Decoded bytes one work item keeps at most (plus one block).
+const CHUNK_DECODED_BUDGET: usize = 64 << 20;
 
 /// A magic found in a chunk, with its block decoded on the guess that the
 /// next magic ends it.
@@ -493,7 +495,7 @@ fn work(file: &File, size: u64, chunk: u64) -> io::Result<Vec<Found>> {
             break;
         }
         let old = data.len();
-        let more = ((size - start) as usize - old).min(256 << 10);
+        let more = (size - start - old as u64).min(256 << 10) as usize;
         data.resize(old + more, 0);
         crate::archive::pread_exact(file, &mut data[old..], start + old as u64)
             .map_err(io::Error::other)?;
@@ -509,7 +511,17 @@ fn work(file: &File, size: u64, chunk: u64) -> io::Result<Vec<Found>> {
         scan(&data, scanned, data.len(), start, &mut after);
     }
     let mut found = Vec::with_capacity(cands.len());
+    // Runs of repeated bytes make blocks expand up to ~46 MB each: past the
+    // budget, blocks are left for the reader to decode when it gets there.
+    let mut decoded = 0usize;
     for (i, &c) in cands.iter().enumerate() {
+        if decoded >= CHUNK_DECODED_BUDGET {
+            found.push(Found {
+                cand: c,
+                block: None,
+            });
+            continue;
+        }
         let block = (c.kind == Magic::Block).then(|| {
             let next = cands.get(i + 1).or(after.first()).copied();
             match next {
@@ -521,6 +533,9 @@ fn work(file: &File, size: u64, chunk: u64) -> io::Result<Vec<Found>> {
                 None => Err(invalid("no end found")),
             }
         });
+        if let Some(Ok((data, _, _))) = &block {
+            decoded += data.len();
+        }
         found.push(Found { cand: c, block });
     }
     Ok(found)
@@ -546,14 +561,14 @@ pub(crate) struct ParallelIndexer {
 impl ParallelIndexer {
     pub fn new(file: Arc<File>, spacing: u64, threads: usize) -> io::Result<ParallelIndexer> {
         let size = file.metadata()?.len();
-        let threads = threads.max(1);
+        let threads = threads.clamp(1, 1024);
         let f = file.clone();
         let chunks = Ordered::new(
             size.div_ceil(CHUNK_BYTES),
             threads,
             threads as u64 * 2,
             move |k| work(&f, size, k),
-        );
+        )?;
         Ok(ParallelIndexer {
             file,
             chunks,

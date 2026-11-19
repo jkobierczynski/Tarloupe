@@ -103,9 +103,10 @@ point to; dangling links, devices and FIFOs are hidden.
   the start.
   Concatenated streams, stream padding and every check type are supported,
   and each block's check is verified.
-* **bzip2:** every block (up to 900 kB of data) is a restart point, in any
-  bzip2 file: plain `bzip2`, `lbzip2`, `pbzip2` and concatenated streams.
-  Blocks start at any bit, so the index stores bit offsets, as for gzip.
+* **bzip2:** decoding can restart at any block, in any bzip2 file: plain
+  `bzip2`, `lbzip2`, `pbzip2` and concatenated streams. As for gzip, the
+  index keeps the first block after every `--checkpoint-spacing` bytes
+  (8 MiB by default), as a bit offset since blocks start at any bit.
   The first pass finds and decodes blocks on every core
   (`--index-threads N` to change that). Indexes made by 0.1 for bzip2 files
   are rebuilt once to gain the block restart points.
@@ -192,8 +193,8 @@ archive, same machine:
 
 | First index of the 4 GiB `.tar.gz` | Time |
 |---|---|
-| `tarloupe index --index-threads 1` | 8.3 s |
-| `tarloupe index` (4 threads) | **4.4 s** |
+| `tarloupe index --force --index-threads 1` | 8.3 s |
+| `tarloupe index --force` (4 threads) | **4.4 s** |
 | ratarmount 1.3 (`-P 4`, rapidgzip) | 9.0 s |
 
 (The 6.4 s in the table above was measured on an earlier build.)
@@ -221,8 +222,8 @@ MiB), on the same 4 vCPU machine:
 | Step | Time |
 |---|---|
 | `bzip2 -dc` of the whole archive (baseline) | 56.3 s |
-| `tarloupe index --index-threads 1` | 59.4 s |
-| `tarloupe index` (4 threads) | **15.5 s** |
+| `tarloupe index --force --index-threads 1` | 59.4 s |
+| `tarloupe index --force` (4 threads) | **15.5 s** |
 | ratarmount 1.3 index (`-P 4`, indexed_bzip2) | 15.0 s |
 | `tarloupe cat` of the last file | 0.47 s |
 

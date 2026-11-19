@@ -384,16 +384,23 @@ impl Input {
     }
 }
 
+/// One positional read, retried when interrupted.
 pub(crate) fn read_at(file: &std::fs::File, buf: &mut [u8], off: u64) -> io::Result<usize> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        file.read_at(buf, off)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt;
-        file.seek_read(buf, off)
+    loop {
+        #[cfg(unix)]
+        let r = {
+            use std::os::unix::fs::FileExt;
+            file.read_at(buf, off)
+        };
+        #[cfg(windows)]
+        let r = {
+            use std::os::windows::fs::FileExt;
+            file.seek_read(buf, off)
+        };
+        match r {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            r => return r,
+        }
     }
 }
 
@@ -429,7 +436,7 @@ impl<T: Send + 'static> Ordered<T> {
         threads: usize,
         window: u64,
         work: impl Fn(u64) -> T + Send + Sync + 'static,
-    ) -> Ordered<T> {
+    ) -> io::Result<Ordered<T>> {
         let shared = Arc::new(OrderedShared {
             queue: Mutex::new(OrderedQueue {
                 next: 0,
@@ -441,36 +448,37 @@ impl<T: Send + 'static> Ordered<T> {
         });
         let work = Arc::new(work);
         let window = window.max(1);
-        let workers = (0..threads.max(1).min(items.max(1) as usize))
-            .map(|_| {
-                let (shared, work) = (shared.clone(), work.clone());
-                std::thread::spawn(move || loop {
-                    let k = {
-                        let mut q = shared.queue.lock().unwrap();
-                        loop {
-                            if shared.stop.load(Ordering::Relaxed) || q.next >= items {
-                                return;
-                            }
-                            if q.next < q.wanted + window {
-                                break;
-                            }
-                            q = shared.cv.wait(q).unwrap();
-                        }
-                        q.next += 1;
-                        q.next - 1
-                    };
-                    let r = work(k);
-                    shared.queue.lock().unwrap().done.insert(k, r);
-                    shared.cv.notify_all();
-                })
-            })
-            .collect();
-        Ordered {
-            shared,
-            workers,
+        let mut ordered = Ordered {
+            shared: shared.clone(),
+            workers: Vec::new(),
             items,
             take: 0,
+        };
+        for _ in 0..threads.max(1).min(items.max(1) as usize) {
+            let (shared, work) = (shared.clone(), work.clone());
+            let w = std::thread::Builder::new().spawn(move || loop {
+                let k = {
+                    let mut q = shared.queue.lock().unwrap();
+                    loop {
+                        if shared.stop.load(Ordering::Relaxed) || q.next >= items {
+                            return;
+                        }
+                        if q.next < q.wanted + window {
+                            break;
+                        }
+                        q = shared.cv.wait(q).unwrap();
+                    }
+                    q.next += 1;
+                    q.next - 1
+                };
+                let r = work(k);
+                shared.queue.lock().unwrap().done.insert(k, r);
+                shared.cv.notify_all();
+            });
+            // On failure, dropping `ordered` stops the workers started so far.
+            ordered.workers.push(w?);
         }
+        Ok(ordered)
     }
 
     /// Index of the item [`Ordered::next`] returns next.
@@ -500,8 +508,13 @@ impl<T: Send + 'static> Ordered<T> {
 
 impl<T: Send + 'static> Drop for Ordered<T> {
     fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Relaxed);
-        self.shared.cv.notify_all();
+        {
+            // Under the lock, so no worker can miss the wake-up between
+            // checking `stop` and waiting.
+            let _q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            self.shared.stop.store(true, Ordering::Relaxed);
+            self.shared.cv.notify_all();
+        }
         for w in self.workers.drain(..) {
             let _ = w.join();
         }

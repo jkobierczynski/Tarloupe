@@ -625,13 +625,13 @@ impl ParallelIndexer {
         chunk: u64,
     ) -> io::Result<ParallelIndexer> {
         let size = file.metadata()?.len();
-        let threads = threads.max(1);
+        let threads = threads.clamp(1, 1024);
         let window = threads as u64 * 2;
         let cap = (MEMORY_BUDGET / window as usize).max(16 << 20);
         let f = file.clone();
         let chunks = Ordered::new(size.div_ceil(chunk).max(1), threads, window, move |k| {
             work(&f, size, chunk, k, cap)
-        });
+        })?;
         Ok(ParallelIndexer {
             file,
             chunks,
