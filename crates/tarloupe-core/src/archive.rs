@@ -532,12 +532,21 @@ fn build_index(
     report.start();
     let walked = (|| -> Result<_> {
         Ok(match codec {
-            Codec::Gzip => {
-                let mut reader = IndexingReader::new(file.clone(), spacing)?;
-                let members = walk_compressed(&mut reader, &mut report)?;
-                let size = reader.position();
-                (members, std::mem::take(&mut reader.checkpoints), size)
-            }
+            Codec::Gzip => match opts.threads.unwrap_or_else(default_threads) {
+                1 => {
+                    let mut reader = IndexingReader::new(file.clone(), spacing)?;
+                    let members = walk_compressed(&mut reader, &mut report)?;
+                    let size = reader.position();
+                    (members, std::mem::take(&mut reader.checkpoints), size)
+                }
+                threads => {
+                    let mut reader =
+                        crate::gzip_par::ParallelIndexer::new(file.clone(), spacing, threads)?;
+                    let members = walk_compressed(&mut reader, &mut report)?;
+                    let size = reader.position();
+                    (members, std::mem::take(&mut reader.checkpoints), size)
+                }
+            },
             Codec::Bzip2 => {
                 let threads = opts.threads.unwrap_or_else(default_threads);
                 let mut reader = crate::bz2::ParallelIndexer::new(file.clone(), spacing, threads)?;
@@ -598,6 +607,12 @@ trait Indexing: Read {
 impl Indexing for IndexingReader {
     fn compressed_position(&self) -> u64 {
         IndexingReader::compressed_position(self)
+    }
+}
+
+impl Indexing for crate::gzip_par::ParallelIndexer {
+    fn compressed_position(&self) -> u64 {
+        crate::gzip_par::ParallelIndexer::compressed_position(self)
     }
 }
 

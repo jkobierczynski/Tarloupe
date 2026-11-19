@@ -23,16 +23,14 @@
 //! Data after the last stream that does not start a new one is ignored,
 //! as `bzip2 -d` does.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::thread::JoinHandle;
+use std::sync::{Arc, OnceLock};
 
 use bzip2::{Decompress, Status};
 
-use crate::stream::{invalid, read_at, Checkpoint, Decoder, Opener, Step};
+use crate::stream::{invalid, read_at, Checkpoint, Decoder, Opener, Ordered, Step};
 
 /// The magic that starts every block.
 const BLOCK_MAGIC: u64 = 0x3141_5926_5359;
@@ -528,30 +526,12 @@ fn work(file: &File, size: u64, chunk: u64) -> io::Result<Vec<Found>> {
     Ok(found)
 }
 
-struct Queue {
-    /// Next chunk a worker should take.
-    next: u64,
-    /// The chunk the reader waits for; workers stay within a window of it.
-    wanted: u64,
-    done: BTreeMap<u64, io::Result<Vec<Found>>>,
-}
-
-struct Shared {
-    queue: Mutex<Queue>,
-    cv: Condvar,
-    stop: AtomicBool,
-}
-
 /// The indexing reader: decodes blocks on worker threads and returns the
 /// data in order, recording a checkpoint at the first block start after
 /// every `spacing` bytes.
 pub(crate) struct ParallelIndexer {
     file: Arc<File>,
-    shared: Arc<Shared>,
-    workers: Vec<JoinHandle<()>>,
-    chunks: u64,
-    /// Next chunk to take from the queue.
-    take: u64,
+    chunks: Ordered<io::Result<Vec<Found>>>,
     found: VecDeque<Found>,
     next: Next,
     crc: Option<u32>,
@@ -566,48 +546,17 @@ pub(crate) struct ParallelIndexer {
 impl ParallelIndexer {
     pub fn new(file: Arc<File>, spacing: u64, threads: usize) -> io::Result<ParallelIndexer> {
         let size = file.metadata()?.len();
-        let chunks = size.div_ceil(CHUNK_BYTES);
         let threads = threads.max(1);
-        let window = (threads as u64) * 2;
-        let shared = Arc::new(Shared {
-            queue: Mutex::new(Queue {
-                next: 0,
-                wanted: 0,
-                done: BTreeMap::new(),
-            }),
-            cv: Condvar::new(),
-            stop: AtomicBool::new(false),
-        });
-        let workers = (0..threads.min(chunks.max(1) as usize))
-            .map(|_| {
-                let (file, shared) = (file.clone(), shared.clone());
-                std::thread::spawn(move || loop {
-                    let k = {
-                        let mut q = shared.queue.lock().unwrap();
-                        loop {
-                            if shared.stop.load(Ordering::Relaxed) || q.next >= chunks {
-                                return;
-                            }
-                            if q.next < q.wanted + window {
-                                break;
-                            }
-                            q = shared.cv.wait(q).unwrap();
-                        }
-                        q.next += 1;
-                        q.next - 1
-                    };
-                    let r = work(&file, size, k);
-                    shared.queue.lock().unwrap().done.insert(k, r);
-                    shared.cv.notify_all();
-                })
-            })
-            .collect();
+        let f = file.clone();
+        let chunks = Ordered::new(
+            size.div_ceil(CHUNK_BYTES),
+            threads,
+            threads as u64 * 2,
+            move |k| work(&f, size, k),
+        );
         Ok(ParallelIndexer {
             file,
-            shared,
-            workers,
             chunks,
-            take: 0,
             found: VecDeque::new(),
             next: Next::Header {
                 byte: 0,
@@ -631,30 +580,19 @@ impl ParallelIndexer {
         match self.next {
             Next::Header { byte, .. } => byte,
             Next::Magic { bit } => bit / 8,
-            Next::Done => self.take * CHUNK_BYTES,
+            Next::Done => self.chunks.position() * CHUNK_BYTES,
         }
     }
 
     /// Waits for the next chunk's magics. Returns false when all are taken.
     fn pull(&mut self) -> io::Result<bool> {
-        if self.take >= self.chunks {
-            return Ok(false);
-        }
-        let k = self.take;
-        let found = {
-            let mut q = self.shared.queue.lock().unwrap();
-            q.wanted = k;
-            self.shared.cv.notify_all();
-            loop {
-                if let Some(r) = q.done.remove(&k) {
-                    break r;
-                }
-                q = self.shared.cv.wait(q).unwrap();
+        match self.chunks.next() {
+            Some(found) => {
+                self.found.extend(found?);
+                Ok(true)
             }
-        };
-        self.take += 1;
-        self.found.extend(found?);
-        Ok(true)
+            None => Ok(false),
+        }
     }
 
     /// Decodes the next block into `self.block`. Returns false at the end.
@@ -719,16 +657,6 @@ impl io::Read for ParallelIndexer {
         self.at += n;
         self.pos += n as u64;
         Ok(n)
-    }
-}
-
-impl Drop for ParallelIndexer {
-    fn drop(&mut self) {
-        self.shared.stop.store(true, Ordering::Relaxed);
-        self.shared.cv.notify_all();
-        for w in self.workers.drain(..) {
-            let _ = w.join();
-        }
     }
 }
 

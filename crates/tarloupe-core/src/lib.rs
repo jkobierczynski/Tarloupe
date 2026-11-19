@@ -13,6 +13,7 @@ pub mod convert;
 pub mod entry;
 pub mod error;
 pub mod gzip;
+mod gzip_par;
 pub mod header;
 pub mod index;
 pub mod key;

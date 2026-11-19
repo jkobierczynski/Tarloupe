@@ -180,9 +180,25 @@ single files. Linux, 4 vCPUs, warm page cache, 7-Zip 23.01, GNU tar 1.35:
 | Index size | 14 MB (0.8% of the archive) |
 
 The plan's target for a random 10 MB read is under 300 ms; it takes 31 ms
-here, and the cost does not grow with the archive size. The first index
-decodes the archive once (zlib-rs, single-threaded); a parallel first pass
-is M4.
+here, and the cost does not grow with the archive size.
+
+The first pass decodes on every core (`--index-threads N` to change
+that, 1 for the old single-threaded pass). Workers each take a 4 MiB
+piece of the file, find the first deflate block in it and decode from
+there, using made-up windows that show which output bytes still depend
+on the data before the piece; the indexing thread fills those in, checks
+that the pieces join up and checks every member's CRC. Same 4 GiB
+archive, same machine:
+
+| First index of the 4 GiB `.tar.gz` | Time |
+|---|---|
+| `tarloupe index --index-threads 1` | 8.3 s |
+| `tarloupe index` (4 threads) | **4.4 s** |
+| ratarmount 1.3 (`-P 4`, rapidgzip) | 9.0 s |
+
+(The 6.4 s in the table above was measured on an earlier build.)
+Files written as one huge deflate block (zlib-ng or zlib-rs at level 1)
+cannot be split this way and are decoded on one thread.
 
 ## Benchmark: zstd and xz from `tarloupe convert`
 
@@ -246,7 +262,7 @@ partly random, so compressors behave realistically.
 | **M1** gzip engine | Checkpoint index with saved deflate windows, random reads, chunk cache, benchmarks. *(done)* |
 | **M2** Windows MVP | WinFsp read-only mount, "Browse with Tarloupe" in Explorer, tray app, installer. *(done, 0.1.0)* |
 | **M3** More codecs | Seekable/multi-frame zstd, multi-block xz, bzip2 (multi-stream), sequential fallback, `convert`. *(done)* |
-| M4 Speed | Parallel gzip first pass, parallel bzip2 *(bzip2 done)*, background indexing while browsing. |
+| M4 Speed | Parallel gzip first pass, parallel bzip2 *(both done)*, background indexing while browsing. |
 | M5 Native feel | Shell namespace extension, Windows 11 context menu. |
 | M6 Reach | Linux FUSE, ratarmount index import, nested archives. |
 
