@@ -24,6 +24,7 @@
 
 use std::fs::File;
 use std::io;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use libz_rs_sys as z;
@@ -328,13 +329,11 @@ impl Stream {
             if out.capacity() - out.len() < 64 << 10 {
                 out.reserve(1 << 20);
             }
-            let spare = out.spare_capacity_mut();
-            // zlib only writes the bytes it reports as produced.
-            let spare = unsafe {
-                std::slice::from_raw_parts_mut(spare.as_mut_ptr() as *mut u8, spare.len())
-            };
-            let (used, produced, ret) = self.inf.inflate(self.input.data(), spare);
+            let (used, produced, ret) = self
+                .inf
+                .inflate_uninit(self.input.data(), out.spare_capacity_mut());
             self.input.consume(used);
+            // SAFETY: zlib initialized the `produced` bytes it wrote.
             unsafe { out.set_len(out.len() + produced) };
             match ret {
                 z::Z_OK | z::Z_BUF_ERROR => {}
@@ -401,6 +400,13 @@ fn parse_header(file: &File, at: u64) -> io::Result<u64> {
         }
     }
     if flags & 2 != 0 {
+        // The header CRC: the low 16 bits of the CRC-32 of the header.
+        let mut hdr = vec![0u8; (p - at + 2) as usize];
+        read_exact(file, &mut hdr, at)?;
+        let n = hdr.len() - 2;
+        if crc32(0, &hdr[..n]) as u16 != u16::from_le_bytes([hdr[n], hdr[n + 1]]) {
+            return Err(invalid("gzip: header crc mismatch"));
+        }
         p += 2;
     }
     Ok(p)
@@ -424,6 +430,10 @@ fn header_in(d: &[u8], q: usize) -> Option<usize> {
         }
     }
     if flags & 2 != 0 {
+        let c = d.get(p..p + 2)?;
+        if crc32(0, &d[q..p]) as u16 != u16::from_le_bytes([c[0], c[1]]) {
+            return None;
+        }
         p += 2;
     }
     (p < d.len()).then_some(p)
@@ -611,11 +621,19 @@ pub(crate) struct ParallelIndexer {
     /// Chunks used, and bytes decoded here because no chunk covered them.
     pub stats: (u64, u64),
     chunk: u64,
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 impl ParallelIndexer {
-    pub fn new(file: Arc<File>, spacing: u64, threads: usize) -> io::Result<ParallelIndexer> {
-        Self::with_chunk(file, spacing, threads, CHUNK_BYTES)
+    pub fn new(
+        file: Arc<File>,
+        spacing: u64,
+        threads: usize,
+        cancel: Option<Arc<AtomicBool>>,
+    ) -> io::Result<ParallelIndexer> {
+        let mut p = Self::with_chunk(file, spacing, threads, CHUNK_BYTES)?;
+        p.cancel = cancel;
+        Ok(p)
     }
 
     fn with_chunk(
@@ -649,6 +667,7 @@ impl ParallelIndexer {
             checkpoints: Vec::new(),
             stats: (0, 0),
             chunk,
+            cancel: None,
         })
     }
 
@@ -774,6 +793,14 @@ impl ParallelIndexer {
     /// The next decoded chunk, skipping failed ones; `None` when all are used.
     fn next_chunk(&mut self) -> Option<ChunkOut> {
         loop {
+            // A long run of failed chunks must not hold up cancelling.
+            if self
+                .cancel
+                .as_ref()
+                .is_some_and(|c| c.load(Ordering::Relaxed))
+            {
+                return None;
+            }
             match self.chunks.next()? {
                 Ok(c) => return Some(c),
                 Err(_) => continue,
@@ -1093,6 +1120,21 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn header_crc_is_checked() {
+        let mut h = vec![0x1f, 0x8b, 8, 2, 0, 0, 0, 0, 0, 3];
+        let c = crc32(0, &h) as u16;
+        h.extend(c.to_le_bytes());
+        h.extend([0u8; 8]);
+        assert_eq!(header_in(&h, 0), Some(12));
+        let (_d, file) = temp(&h);
+        assert_eq!(parse_header(&file, 0).unwrap(), 12);
+        h[10] ^= 1;
+        assert_eq!(header_in(&h, 0), None);
+        let (_d, file) = temp(&h);
+        assert!(parse_header(&file, 0).is_err());
     }
 
     #[test]

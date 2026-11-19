@@ -540,8 +540,12 @@ fn build_index(
                     (members, std::mem::take(&mut reader.checkpoints), size)
                 }
                 threads => {
-                    let mut reader =
-                        crate::gzip_par::ParallelIndexer::new(file.clone(), spacing, threads)?;
+                    let mut reader = crate::gzip_par::ParallelIndexer::new(
+                        file.clone(),
+                        spacing,
+                        threads,
+                        opts.cancel.clone(),
+                    )?;
                     let members = walk_compressed(&mut reader, &mut report)?;
                     let size = reader.position();
                     (members, std::mem::take(&mut reader.checkpoints), size)

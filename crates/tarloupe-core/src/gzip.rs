@@ -80,10 +80,27 @@ impl Inflater {
 
     /// One `inflate(Z_BLOCK)` call. Returns (consumed, produced, code).
     pub(crate) fn inflate(&mut self, input: &[u8], output: &mut [u8]) -> (usize, usize, i32) {
+        // SAFETY: initialized bytes are valid `MaybeUninit` bytes.
+        let output = unsafe {
+            std::slice::from_raw_parts_mut(
+                output.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>,
+                output.len(),
+            )
+        };
+        self.inflate_uninit(input, output)
+    }
+
+    /// Like [`Inflater::inflate`], into memory that need not be initialized
+    /// (zlib only writes the bytes it reports as produced).
+    pub(crate) fn inflate_uninit(
+        &mut self,
+        input: &[u8],
+        output: &mut [std::mem::MaybeUninit<u8>],
+    ) -> (usize, usize, i32) {
         let s = &mut *self.strm;
         s.next_in = input.as_ptr();
         s.avail_in = input.len().min(u32::MAX as usize) as z::uInt;
-        s.next_out = output.as_mut_ptr();
+        s.next_out = output.as_mut_ptr() as *mut u8;
         s.avail_out = output.len().min(u32::MAX as usize) as z::uInt;
         let (ai, ao) = (s.avail_in as usize, s.avail_out as usize);
         let ret = unsafe { z::inflate(s, z::Z_BLOCK) };
