@@ -180,10 +180,11 @@ fn every_codec_reads_like_the_plain_tar() {
             false,
         ),
         (
+            // Every block of a bzip2 stream is a restart point.
             "bzip2-one-stream",
             bzip2_streams(&tar, usize::MAX),
             Codec::Bzip2,
-            false,
+            true,
         ),
         (
             "bzip2-streams",
@@ -214,7 +215,7 @@ fn every_codec_reads_like_the_plain_tar() {
         variants.push(("xz-cli-blocks", x, Codec::Xz, true));
     }
     if let Some(x) = external("bzip2", &["-c", "-9"], &tar_path) {
-        variants.push(("bzip2-cli", x, Codec::Bzip2, false));
+        variants.push(("bzip2-cli", x, Codec::Bzip2, true));
     }
 
     for (i, (name, data, codec, seekable)) in variants.iter().enumerate() {
@@ -224,7 +225,9 @@ fn every_codec_reads_like_the_plain_tar() {
         assert_eq!(a.codec(), *codec, "{name}");
         let points = checkpoints(&a);
         if *seekable {
-            assert!(points > 10, "{name}: only {points} checkpoints");
+            // bzip2 blocks hold up to 900 kB, so a few MiB has only a few.
+            let least = if *codec == Codec::Bzip2 { 5 } else { 10 };
+            assert!(points > least, "{name}: only {points} checkpoints");
         } else {
             assert_eq!(points, 0, "{name}: {points} checkpoints");
         }
@@ -476,4 +479,66 @@ fn misaligned_checkpoints_rebuild_the_index() {
         a.index_status(),
         tarloupe_core::archive::IndexStatus::Rebuilt
     );
+}
+
+#[test]
+fn bzip2_indexes_without_blocks_are_rebuilt() {
+    // Indexes of 0.1 only recorded where bzip2 streams start; they are
+    // rebuilt so that single-stream files get their block restart points.
+    let dir = tempfile::tempdir().unwrap();
+    let idx = dir.path().join("idx");
+    let tar = sample_tar();
+    let path = dir.path().join("f.tar.bz2");
+    fs::write(&path, bzip2_streams(&tar, usize::MAX)).unwrap();
+    let a = open(&path, &idx);
+    assert!(checkpoints(&a) > 10);
+    let index = a.index_path().to_path_buf();
+    drop(a);
+    let db = rusqlite::Connection::open(&index).unwrap();
+    db.execute("DELETE FROM meta WHERE key = 'bzip2_seek'", [])
+        .unwrap();
+    drop(db);
+    let a = open(&path, &idx);
+    assert_eq!(
+        a.index_status(),
+        tarloupe_core::archive::IndexStatus::Rebuilt
+    );
+}
+
+#[test]
+fn bzip2_indexes_the_same_on_any_thread_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let tar = sample_tar();
+    let path = dir.path().join("f.tar.bz2");
+    fs::write(&path, bzip2_streams(&tar, 700_000)).unwrap();
+    let plain_path = dir.path().join("f.tar");
+    fs::write(&plain_path, &tar).unwrap();
+    let plain = open(&plain_path, &dir.path().join("p"));
+    let mut seen = None;
+    for threads in [1, 2, 7] {
+        let a = Archive::open(
+            &path,
+            &OpenOptions {
+                index_dir: Some(dir.path().join(format!("t{threads}"))),
+                threads: Some(threads),
+                checkpoint_spacing: Some(SPACING),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let points: Vec<_> = a
+            .index()
+            .checkpoints()
+            .unwrap()
+            .iter()
+            .map(|p| (p.uncompressed_offset, p.bit_offset))
+            .collect();
+        assert!(points.len() > 5);
+        assert!(points.iter().any(|p| p.1 % 8 != 0), "block starts mid-byte");
+        match &seen {
+            None => seen = Some(points),
+            Some(s) => assert_eq!(s, &points, "threads {threads}"),
+        }
+        assert_same(&plain, &a, threads as u64);
+    }
 }

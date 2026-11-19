@@ -36,6 +36,10 @@ struct IndexOpts {
     /// (default). Smaller makes random reads faster and the index larger.
     #[arg(long, global = true, value_name = "SIZE", value_parser = parse_size)]
     checkpoint_spacing: Option<u64>,
+    /// Threads that decode while an index is built (default: one per CPU).
+    /// Used for bzip2 and gzip.
+    #[arg(long, global = true, value_name = "N")]
+    index_threads: Option<usize>,
 }
 
 #[derive(Subcommand)]
@@ -173,6 +177,7 @@ fn open(archive: &PathBuf, idx: &IndexOpts, rebuild: bool) -> Result<Archive> {
         checkpoint_spacing: idx.checkpoint_spacing,
         progress: None,
         cancel: None,
+        threads: idx.index_threads.filter(|&n| n > 0),
     };
     let start = Instant::now();
     let a = Archive::open(archive, &opts)

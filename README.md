@@ -103,9 +103,12 @@ point to; dangling links, devices and FIFOs are hidden.
   the start.
   Concatenated streams, stream padding and every check type are supported,
   and each block's check is verified.
-* **bzip2:** files made of many streams (`pbzip2`, `cat a.bz2 b.bz2`) restart
-  at each stream. Inside one stream (plain `bzip2`, `lbzip2`), jumping to a
-  block is M4, so for now those read from the start.
+* **bzip2:** every block (up to 900 kB of data) is a restart point, in any
+  bzip2 file: plain `bzip2`, `lbzip2`, `pbzip2` and concatenated streams.
+  Blocks start at any bit, so the index stores bit offsets, as for gzip.
+  The first pass finds and decodes blocks on every core
+  (`--index-threads N` to change that). Indexes made by 0.1 for bzip2 files
+  are rebuilt once to gain the block restart points.
 * **Slow archives:** when some data can only be reached by decoding more
   than 64 MiB, `tarloupe` says why after indexing and suggests `convert`.
 * **`tarloupe convert`** recompresses any archive Tarloupe reads into
@@ -194,6 +197,22 @@ A 1 GiB bulk corpus (6,882 members) on the same 4 vCPU Linux machine:
 `-l 1` makes the zstd conversion 2.2 s for a 2% larger file. Reads cost
 at most one 8 MiB frame or block of decoding, whatever the archive size.
 
+## Benchmark: bzip2
+
+The same 1 GiB corpus, compressed with plain `bzip2 -9` (one stream, 394
+MiB), on the same 4 vCPU machine:
+
+| Step | Time |
+|---|---|
+| `bzip2 -dc` of the whole archive (baseline) | 56.3 s |
+| `tarloupe index --index-threads 1` | 59.4 s |
+| `tarloupe index` (4 threads) | **15.5 s** |
+| ratarmount 1.3 index (`-P 4`, indexed_bzip2) | 15.0 s |
+| `tarloupe cat` of the last file | 0.47 s |
+
+Before block restart points, a read of the last file decoded the whole
+stream (about a minute).
+
 ## Test corpus generator
 
 `tarloupe-corpus` writes deterministic archives for tests and benchmarks:
@@ -226,8 +245,8 @@ partly random, so compressors behave realistically.
 | **M0** Foundations | Workspace, corpus generator, tar walker, `.tar` index, CLI. *(done)* |
 | **M1** gzip engine | Checkpoint index with saved deflate windows, random reads, chunk cache, benchmarks. *(done)* |
 | **M2** Windows MVP | WinFsp read-only mount, "Browse with Tarloupe" in Explorer, tray app, installer. *(done, 0.1.0)* |
-| **M3** More codecs | Seekable/multi-frame zstd, multi-block xz, bzip2 (sequential, multi-stream), sequential fallback, `convert`. *(done)* |
-| M4 Speed | Parallel gzip first pass, parallel bzip2. |
+| **M3** More codecs | Seekable/multi-frame zstd, multi-block xz, bzip2 (multi-stream), sequential fallback, `convert`. *(done)* |
+| M4 Speed | Parallel gzip first pass, parallel bzip2 *(bzip2 done)*, background indexing while browsing. |
 | M5 Native feel | Shell namespace extension, Windows 11 context menu. |
 | M6 Reach | Linux FUSE, ratarmount index import, nested archives. |
 

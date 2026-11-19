@@ -6,9 +6,9 @@
 //!   parent directories. Lookups ignore superseded rows (last one wins).
 //! - `checkpoints`: decoder restart points for compressed streams (gzip:
 //!   bit offset plus the zlib-compressed 32 KiB window before it; zstd and
-//!   bzip2: the offset of a frame or stream; xz: the offset of a block plus
-//!   the stream's check type). Offsets are in bits for every codec; all but
-//!   gzip's are multiples of 8.
+//!   bzip2: the offset of a frame or block magic; xz: the offset of a block
+//!   plus the stream's check type). Offsets are in bits for every codec;
+//!   all but gzip's and bzip2's are multiples of 8.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,6 +25,10 @@ use crate::key::ArchiveKey;
 use crate::path::parent;
 
 pub const FORMAT_VERSION: i64 = 2;
+
+/// Meta key set to `blocks` when bzip2 checkpoints are block starts
+/// (indexes of Tarloupe 0.1 only recorded stream starts).
+pub const BZIP2_SEEK: &str = "bzip2_seek";
 
 const SCHEMA: &str = "
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -228,6 +232,10 @@ impl Index {
                     ("member_count", members.to_string()),
                     ("checkpoint_count", checkpoints.len().to_string()),
                     ("stream_size", stream_size.to_string()),
+                    (
+                        BZIP2_SEEK,
+                        if codec == Codec::Bzip2 { "blocks" } else { "" }.to_string(),
+                    ),
                     // Unique per build (the temp file was created
                     // exclusively), so two builds never look the same.
                     (

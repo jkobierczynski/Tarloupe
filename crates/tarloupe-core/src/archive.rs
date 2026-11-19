@@ -43,6 +43,9 @@ pub struct OpenOptions {
     /// When set while an index is built, building stops with
     /// [`Error::Cancelled`].
     pub cancel: Option<Arc<AtomicBool>>,
+    /// Threads to decode with while building an index (default: one per
+    /// core). Only codecs whose first pass runs in parallel use it.
+    pub threads: Option<usize>,
 }
 
 impl std::fmt::Debug for OpenOptions {
@@ -55,6 +58,7 @@ impl std::fmt::Debug for OpenOptions {
             .field("checkpoint_spacing", &self.checkpoint_spacing)
             .field("progress", &self.progress.is_some())
             .field("cancel", &self.cancel)
+            .field("threads", &self.threads)
             .finish()
     }
 }
@@ -238,8 +242,8 @@ impl Archive {
                  so reads have to decode it from the start"
             }
             Codec::Bzip2 => {
-                "this bzip2 file is one single stream, and Tarloupe cannot yet jump \
-                 into the middle of a bzip2 stream, so reads decode it from the start"
+                "this bzip2 file has no block where decoding can start, so reads \
+                 decode it from the start"
             }
         })
     }
@@ -406,8 +410,8 @@ impl Archive {
 const SLOW_DISTANCE: u64 = 64 << 20;
 
 /// Loads the restart points, rejecting ones the codec cannot start at:
-/// past the end of the file, mid-byte (only gzip resumes there), or, for
-/// xz, without the one-byte check type it needs.
+/// past the end of the file, mid-byte (only gzip and bzip2 resume there),
+/// or, for xz, without the one-byte check type it needs.
 fn load_points(index: &Index, codec: Codec, file_size: u64) -> Result<Vec<Point>> {
     let points = index.checkpoints()?;
     let stale = |reason: &str| Error::StaleIndex {
@@ -417,7 +421,12 @@ fn load_points(index: &Index, codec: Codec, file_size: u64) -> Result<Vec<Point>
     if points.iter().any(|p| p.bit_offset / 8 >= file_size) {
         return Err(stale("checkpoint past the end of the archive"));
     }
-    if codec != Codec::Gzip && points.iter().any(|p| p.bit_offset % 8 != 0) {
+    // Indexes of 0.1 only know where bzip2 streams start, not its blocks.
+    if codec == Codec::Bzip2 && index.meta(crate::index::BZIP2_SEEK)?.as_deref() != Some("blocks") {
+        return Err(stale("made before bzip2 blocks could be reached directly"));
+    }
+    if !matches!(codec, Codec::Gzip | Codec::Bzip2) && points.iter().any(|p| p.bit_offset % 8 != 0)
+    {
         return Err(stale("checkpoint not on a byte boundary"));
     }
     if codec == Codec::Xz && !points.is_empty() && index.checkpoint_state_len_differs(1)? {
@@ -529,7 +538,14 @@ fn build_index(
                 let size = reader.position();
                 (members, std::mem::take(&mut reader.checkpoints), size)
             }
-            Codec::Zstd | Codec::Xz | Codec::Bzip2 => {
+            Codec::Bzip2 => {
+                let threads = opts.threads.unwrap_or_else(default_threads);
+                let mut reader = crate::bz2::ParallelIndexer::new(file.clone(), spacing, threads)?;
+                let members = walk_compressed(&mut reader, &mut report)?;
+                let size = reader.position();
+                (members, std::mem::take(&mut reader.checkpoints), size)
+            }
+            Codec::Zstd | Codec::Xz => {
                 let dec = sequential_decoder(codec, file)?.expect("a compressed codec");
                 let mut reader = Indexer::new(dec, spacing, opts.cancel.clone());
                 let members = walk_compressed(&mut reader, &mut report)?;
@@ -583,6 +599,17 @@ impl Indexing for IndexingReader {
     fn compressed_position(&self) -> u64 {
         IndexingReader::compressed_position(self)
     }
+}
+
+impl Indexing for crate::bz2::ParallelIndexer {
+    fn compressed_position(&self) -> u64 {
+        crate::bz2::ParallelIndexer::compressed_position(self)
+    }
+}
+
+/// Threads for a parallel first pass: one per core.
+pub(crate) fn default_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
 impl Indexing for Indexer {
