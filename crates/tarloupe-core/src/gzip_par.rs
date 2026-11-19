@@ -352,23 +352,24 @@ impl Stream {
     }
 
     /// Decodes up to the next block boundary or the end of the member;
-    /// fails once `out` holds more than `limit` bytes.
+    /// fails rather than let `out` grow past `limit` bytes. Its capacity
+    /// stays within `limit` too, unless it was larger to begin with.
     fn run(&mut self, out: &mut Vec<u8>, limit: usize) -> io::Result<Event> {
         loop {
-            if out.len() > limit {
+            let room = limit.saturating_sub(out.len());
+            if room == 0 {
                 return Err(invalid("deflate block too large to decode ahead"));
             }
             if !self.input.refill()? {
                 return Err(invalid("unexpected end of gzip data"));
             }
-            if out.capacity() - out.len() < 64 << 10 {
-                // Grow by doubling, but never far past `limit`.
-                let room = limit.saturating_sub(out.len()) + (64 << 10);
+            if out.capacity() - out.len() < (64 << 10).min(room) {
+                // Grow by doubling, but not past `limit`.
                 out.reserve_exact(out.len().max(1 << 20).min(room));
             }
-            let (used, produced, ret) = self
-                .inf
-                .inflate_uninit(self.input.data(), out.spare_capacity_mut());
+            let spare = out.spare_capacity_mut();
+            let n = spare.len().min(room);
+            let (used, produced, ret) = self.inf.inflate_uninit(self.input.data(), &mut spare[..n]);
             self.input.consume(used);
             // SAFETY: zlib initialized the `produced` bytes it wrote.
             unsafe { out.set_len(out.len() + produced) };
@@ -1195,6 +1196,29 @@ mod tests {
         assert_eq!(header_in(&h, 0), None);
         let (_d, file) = temp(&h);
         assert!(parse_header(&file, 0).is_err());
+    }
+
+    #[test]
+    fn output_never_passes_the_limit() {
+        // One 4 MiB member, so every limit here ends in an error.
+        let gz = gzip(&sample(4 << 20, 5), 6);
+        let (_d, file) = temp(&gz);
+        let at = parse_header(&file, 0).unwrap();
+        for limit in [1, 1000, 100_000, 3 << 20] {
+            let mut s = Stream::new(&file, at * 8, None).unwrap();
+            let mut out = Vec::new();
+            let mut blocks = 0;
+            loop {
+                match s.run(&mut out, limit) {
+                    Ok(Event::Boundary(_)) => blocks += 1,
+                    Ok(Event::End(_)) => panic!("{limit}: whole member fit"),
+                    Err(_) => break,
+                }
+                assert!(out.len() <= limit, "{limit}: {} bytes", out.len());
+            }
+            assert!(out.len() <= limit && out.capacity() <= limit, "{limit}");
+            assert!(limit < 1 << 20 || blocks > 0, "{limit}");
+        }
     }
 
     #[test]
