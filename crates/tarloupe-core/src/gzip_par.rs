@@ -32,10 +32,45 @@ use libz_rs_sys as z;
 use crate::gzip::{pack_window, GzDecoder, Inflater, WINDOW};
 use crate::stream::{invalid, read_at, Checkpoint, Decoder, Input, Ordered};
 
-/// Compressed bytes per chunk.
+/// Compressed bytes per chunk, at most.
 const CHUNK_BYTES: u64 = 4 << 20;
-/// Decoded bytes all finished-but-unused chunks may hold together, roughly.
+/// Compressed bytes per chunk, at least.
+const MIN_CHUNK_BYTES: u64 = 256 << 10;
+/// Decoded bytes that chunks being decoded or waiting to be read may hold
+/// together. Each of the `window + 1` chunks gets an equal share and never
+/// holds more than it (see [`Limits`]).
 const MEMORY_BUDGET: usize = 512 << 20;
+/// The smallest share one chunk gets. More threads than the budget has
+/// shares for leave the extra ones idle.
+const MIN_SHARE: usize = 8 << 20;
+
+/// How much output one chunk may hold, derived from its memory share.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    /// Stop at the first block boundary past this much output.
+    stop: usize,
+    /// Most output while the three speculative decoders run (each).
+    speculative: usize,
+    /// Most output once one decoder runs alone.
+    run: usize,
+}
+
+impl Limits {
+    /// While speculating: three buffers of `share / 5`, plus two bytes
+    /// per output byte when they become markers. After: the markers
+    /// (`2 * share / 5` at most) and `3 * share / 5` of plain output,
+    /// which leaves a block straddling `stop` `share / 5` to finish in.
+    /// Speculation normally ends within the first megabyte, but data with
+    /// long-range repeats can keep referring to the unknown window for
+    /// several.
+    fn new(share: usize) -> Limits {
+        Limits {
+            stop: share / 5 * 2,
+            speculative: share / 5,
+            run: share / 5 * 3,
+        }
+    }
+}
 
 /// Where a chunk's decoding began.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,7 +362,9 @@ impl Stream {
                 return Err(invalid("unexpected end of gzip data"));
             }
             if out.capacity() - out.len() < 64 << 10 {
-                out.reserve(1 << 20);
+                // Grow by doubling, but never far past `limit`.
+                let room = limit.saturating_sub(out.len()) + (64 << 10);
+                out.reserve_exact(out.len().max(1 << 20).min(room));
             }
             let (used, produced, ret) = self
                 .inf
@@ -401,10 +438,17 @@ fn parse_header(file: &File, at: u64) -> io::Result<u64> {
     }
     if flags & 2 != 0 {
         // The header CRC: the low 16 bits of the CRC-32 of the header.
-        let mut hdr = vec![0u8; (p - at + 2) as usize];
-        read_exact(file, &mut hdr, at)?;
-        let n = hdr.len() - 2;
-        if crc32(0, &hdr[..n]) as u16 != u16::from_le_bytes([hdr[n], hdr[n + 1]]) {
+        let (mut crc, mut q) = (0, at);
+        let mut buf = [0u8; 4096];
+        while q < p {
+            let n = (p - q).min(buf.len() as u64) as usize;
+            read_exact(file, &mut buf[..n], q)?;
+            crc = crc32(crc, &buf[..n]);
+            q += n as u64;
+        }
+        let mut x = [0u8; 2];
+        read_exact(file, &mut x, p)?;
+        if crc as u16 != u16::from_le_bytes(x) {
             return Err(invalid("gzip: header crc mismatch"));
         }
         p += 2;
@@ -465,13 +509,13 @@ fn fake_windows() -> &'static [Vec<u8>; 3] {
 }
 
 /// Decodes from `start` until the first restart point at or past
-/// `end_bit` (or until `cap` bytes), as described in the module docs.
+/// `end_bit` (or past `lim.stop` bytes), as described in the module docs.
 fn decode(
     file: &Arc<File>,
     start: Start,
     bit: u64,
     end_bit: u64,
-    cap: usize,
+    lim: Limits,
 ) -> io::Result<ChunkOut> {
     let known = matches!(start, Start::File | Start::Member(_));
     let fw = fake_windows();
@@ -503,9 +547,14 @@ fn decode(
     // One past the last byte that came from the unknown window.
     let mut last_marker = 0;
     loop {
-        let ev = lo.run(&mut buf, 2 * cap)?;
+        let limit = if extra.is_some() {
+            lim.speculative
+        } else {
+            lim.run
+        };
+        let ev = lo.run(&mut buf, limit)?;
         if let Some((h1, h0, b1, b0)) = &mut extra {
-            let (e1, e0) = (h1.run(b1, 2 * cap)?, h0.run(b0, 2 * cap)?);
+            let (e1, e0) = (h1.run(b1, limit)?, h0.run(b0, limit)?);
             if e1 != ev || e0 != ev || b1.len() != buf.len() || b0.len() != buf.len() {
                 return Err(invalid("speculative gzip decoders disagree"));
             }
@@ -541,7 +590,7 @@ fn decode(
             }
         };
         out.boundaries.push((total, at));
-        if at >= end_bit || total as usize >= cap {
+        if at >= end_bit || total as usize >= lim.stop {
             out.stop = Some(at);
             break;
         }
@@ -569,12 +618,12 @@ fn markers(lo: &[u8], hi1: &[u8], hi0: &[u8], n: usize) -> Vec<u16> {
 }
 
 /// Decodes chunk `k`.
-fn work(file: &Arc<File>, size: u64, chunk: u64, k: u64, cap: usize) -> io::Result<ChunkOut> {
+fn work(file: &Arc<File>, size: u64, chunk: u64, k: u64, lim: Limits) -> io::Result<ChunkOut> {
     let begin = k * chunk;
     let end_bit = (begin + chunk).min(size) * 8;
     if k == 0 {
         let at = parse_header(file, 0)?;
-        return decode(file, Start::File, at * 8, end_bit, cap);
+        return decode(file, Start::File, at * 8, end_bit, lim);
     }
     // The chunk, plus room to read a header that starts near its end.
     let mut d = vec![0u8; (chunk + 1024).min(size - begin) as usize];
@@ -582,7 +631,7 @@ fn work(file: &Arc<File>, size: u64, chunk: u64, k: u64, cap: usize) -> io::Resu
     let to = (chunk.min(size - begin)) * 8;
     let mut from = 0;
     while let Some(start) = find(&d, begin, from, to) {
-        if let Ok(out) = decode(file, start, start.bit(), end_bit, cap) {
+        if let Ok(out) = decode(file, start, start.bit(), end_bit, lim) {
             return Ok(out);
         }
         from = start.bit() - begin * 8 + 1;
@@ -631,7 +680,7 @@ impl ParallelIndexer {
         threads: usize,
         cancel: Option<Arc<AtomicBool>>,
     ) -> io::Result<ParallelIndexer> {
-        let mut p = Self::with_chunk(file, spacing, threads, CHUNK_BYTES)?;
+        let mut p = Self::with_chunk(file, spacing, threads, None)?;
         p.cancel = cancel;
         Ok(p)
     }
@@ -640,16 +689,27 @@ impl ParallelIndexer {
         file: Arc<File>,
         spacing: u64,
         threads: usize,
-        chunk: u64,
+        chunk: Option<u64>,
     ) -> io::Result<ParallelIndexer> {
         let size = file.metadata()?.len();
-        let threads = threads.clamp(1, 1024);
-        let window = threads as u64 * 2;
-        let cap = (MEMORY_BUDGET / window as usize).max(16 << 20);
+        // Workers run at most `window` chunks ahead of the reader, which
+        // holds one more: each of those gets an equal share of the budget.
+        let shares = MEMORY_BUDGET / MIN_SHARE;
+        let window = (threads.clamp(1, 1024) * 2).min(shares - 1);
+        let threads = threads.clamp(1, window);
+        let lim = Limits::new(MEMORY_BUDGET / (window + 1));
+        // Small enough that a chunk usually decodes whole before
+        // `lim.stop`, assuming up to 5:1 compression.
+        let chunk = chunk.unwrap_or_else(|| {
+            ((lim.stop / 5) as u64 & !0xffff).clamp(MIN_CHUNK_BYTES, CHUNK_BYTES)
+        });
         let f = file.clone();
-        let chunks = Ordered::new(size.div_ceil(chunk).max(1), threads, window, move |k| {
-            work(&f, size, chunk, k, cap)
-        })?;
+        let chunks = Ordered::new(
+            size.div_ceil(chunk).max(1),
+            threads,
+            window as u64,
+            move |k| work(&f, size, chunk, k, lim),
+        )?;
         Ok(ParallelIndexer {
             file,
             chunks,
@@ -1012,7 +1072,7 @@ mod tests {
 
     /// Decodes with small chunks, so that many chunks start mid-stream.
     fn parallel(file: &Arc<File>, threads: usize) -> io::Result<Decoded> {
-        let mut p = ParallelIndexer::with_chunk(file.clone(), 1 << 20, threads, 256 << 10)?;
+        let mut p = ParallelIndexer::with_chunk(file.clone(), 1 << 20, threads, Some(256 << 10))?;
         let mut got = Vec::new();
         p.read_to_end(&mut got)?;
         Ok((got, std::mem::take(&mut p.checkpoints), p.stats))
