@@ -8,7 +8,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{mpsc, Arc};
@@ -61,42 +61,44 @@ impl Drop for Guard {
     }
 }
 
-#[test]
-fn mounted_archive_reads_like_the_view() {
+/// Starts `tarloupe mount` and waits until it is mounted at `mnt`. `None`
+/// when WinFsp is missing and not required. Lines it writes to stderr go to
+/// the returned channel.
+fn start(
+    archive: &Path,
+    mnt: &Path,
+    idx: &Path,
+    extra: &[&str],
+) -> Option<(Guard, mpsc::Receiver<String>)> {
     let required = std::env::var_os("TARLOUPE_REQUIRE_WINFSP").is_some_and(|v| v == "1");
-    let dir = tempfile::tempdir().unwrap();
-    let idx = dir.path().join("idx");
-    let archive = sample(dir.path());
-    let a = Archive::open(
-        &archive,
-        &OpenOptions {
-            index_dir: Some(idx.clone()),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    let vfs = Vfs::new(Arc::new(a)).unwrap();
-
-    // A folder mount point must not exist yet; its parent must.
-    let mnt = dir.path().join("mnt");
     let mut child = Command::new(env!("CARGO_BIN_EXE_tarloupe"))
-        .env("TARLOUPE_INDEX_DIR", &idx)
+        .env("TARLOUPE_INDEX_DIR", idx)
         .arg("mount")
-        .arg(&archive)
-        .arg(&mnt)
+        .args(extra)
+        .arg(archive)
+        .arg(mnt)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let stdout = child.stdout.take().unwrap();
-    let mut stderr = child.stderr.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
     let mut guard = Guard(Some(child));
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
         let _ = BufReader::new(stdout).read_line(&mut line);
         let _ = tx.send(line);
+    });
+    let (etx, erx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines() {
+            let Ok(line) = line else { break };
+            if etx.send(line).is_err() {
+                break;
+            }
+        }
     });
     let line = rx
         .recv_timeout(Duration::from_secs(120))
@@ -105,17 +107,21 @@ fn mounted_archive_reads_like_the_view() {
         let c = guard.0.as_mut().unwrap();
         let _ = c.kill();
         let _ = c.wait();
-        let mut err = String::new();
-        let _ = stderr.read_to_string(&mut err);
+        let err: Vec<String> = erx.try_iter().collect();
+        let err = err.join("\n");
         if !required && err.contains("WinFsp is not installed") {
             eprintln!("skipping: WinFsp is not installed");
-            return;
+            return None;
         }
         panic!("mount did not start: {err}");
     }
     assert_eq!(Path::new(line.trim()), mnt);
+    Some((guard, erx))
+}
 
-    // Walk the view and compare each folder and file with what Windows shows.
+/// Compares every folder and file Windows shows under `mnt` with the view.
+/// Returns how many files it read.
+fn compare(vfs: &Vfs, mnt: &Path) -> usize {
     let mut seen = HashSet::new();
     let mut todo = vec![(String::new(), vfs.root().clone())];
     let mut files = 0;
@@ -154,6 +160,42 @@ fn mounted_archive_reads_like_the_view() {
             files += 1;
         }
     }
+    files
+}
+
+/// Ends the mount process and checks that the mount goes with it.
+fn stop(mut guard: Guard, mnt: &Path) {
+    let mut c = guard.0.take().unwrap();
+    c.kill().unwrap();
+    c.wait().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while fs::read_dir(mnt).is_ok() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(fs::read_dir(mnt).is_err(), "still mounted after exit");
+}
+
+#[test]
+fn mounted_archive_reads_like_the_view() {
+    let dir = tempfile::tempdir().unwrap();
+    let idx = dir.path().join("idx");
+    let archive = sample(dir.path());
+    let a = Archive::open(
+        &archive,
+        &OpenOptions {
+            index_dir: Some(idx.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let vfs = Vfs::new(Arc::new(a)).unwrap();
+
+    // A folder mount point must not exist yet; its parent must.
+    let mnt = dir.path().join("mnt");
+    let Some((guard, _)) = start(&archive, &mnt, &idx, &[]) else {
+        return;
+    };
+    let files = compare(&vfs, &mnt);
     assert!(files > 20, "only {files} files");
 
     // Names are looked up without regard to case, and mapped names work.
@@ -182,12 +224,52 @@ fn mounted_archive_reads_like_the_view() {
     assert!(fs::rename(mnt.join("win").join("Makefile"), mnt.join("win").join("x")).is_err());
 
     // Ending the process removes the mount.
-    let mut c = guard.0.take().unwrap();
-    c.kill().unwrap();
-    c.wait().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while fs::read_dir(&mnt).is_ok() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(200));
+    stop(guard, &mnt);
+}
+
+/// With `--live` the archive is mounted before it is indexed. Folders
+/// listed early must not stay as they were: once indexing is done, Windows
+/// shows everything.
+#[test]
+fn live_mount_fills_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = sample(dir.path());
+    let full = Archive::open(
+        &archive,
+        &OpenOptions {
+            index_dir: Some(dir.path().join("full")),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let vfs = Vfs::new(Arc::new(full)).unwrap();
+
+    let mnt = dir.path().join("mnt");
+    let idx = dir.path().join("idx");
+    let Some((guard, stderr)) = start(&archive, &mnt, &idx, &["--live"]) else {
+        return;
+    };
+    // Listed right away, while indexing may still be going on.
+    fs::read_dir(&mnt).unwrap().for_each(drop);
+    if let Ok(d) = fs::read_dir(mnt.join("bulk")) {
+        d.for_each(drop);
     }
-    assert!(fs::read_dir(&mnt).is_err(), "still mounted after exit");
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let line = stderr
+            .recv_timeout(left)
+            .unwrap_or_else(|_| panic!("indexing did not end"));
+        assert!(!line.contains("failed"), "{line}");
+        if line.starts_with("tarloupe: indexed") {
+            break;
+        }
+    }
+    // Folder contents are cached briefly at most.
+    std::thread::sleep(Duration::from_secs(2));
+    let files = compare(&vfs, &mnt);
+    assert!(files > 20, "only {files} files");
+    // The index it wrote is the full one.
+    assert!(fs::read_dir(&idx).unwrap().count() > 0);
+    stop(guard, &mnt);
 }

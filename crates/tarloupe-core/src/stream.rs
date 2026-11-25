@@ -208,7 +208,8 @@ impl ChunkCache {
 
 /// Random-access reader over a compressed file with a loaded checkpoint list.
 pub(crate) struct RandomReader {
-    points: Vec<Point>,
+    /// Grows while the archive is indexed in the background.
+    points: std::sync::RwLock<Vec<Point>>,
     open: Opener,
     cache: Mutex<ChunkCache>,
     /// Idle decoders, each positioned at a chunk boundary.
@@ -218,7 +219,7 @@ pub(crate) struct RandomReader {
 impl RandomReader {
     pub fn new(points: Vec<Point>, open: Opener) -> RandomReader {
         RandomReader {
-            points,
+            points: std::sync::RwLock::new(points),
             open,
             cache: Mutex::new(ChunkCache {
                 map: HashMap::new(),
@@ -226,6 +227,22 @@ impl RandomReader {
             }),
             pool: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The restart points known so far, in stream order.
+    pub fn points(&self) -> Vec<Point> {
+        self.points
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Adds restart points found later in the stream.
+    pub(crate) fn extend_points(&self, more: &[Point]) {
+        self.points
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(more);
     }
 
     /// Fills `buf` from uncompressed offset `off`; fails at end of data.
@@ -251,12 +268,12 @@ impl RandomReader {
             return Ok(c);
         }
         let start = idx * CHUNK;
-        let cp = match self
-            .points
-            .partition_point(|p| p.uncompressed_offset <= start)
-        {
-            0 => None,
-            i => Some(self.points[i - 1]),
+        let cp = {
+            let points = self.points.read().unwrap_or_else(|e| e.into_inner());
+            match points.partition_point(|p| p.uncompressed_offset <= start) {
+                0 => None,
+                i => Some(points[i - 1]),
+            }
         };
         let cp_off = cp.map_or(0, |p| p.uncompressed_offset);
         // Reuse an idle decoder between the checkpoint and the chunk.

@@ -18,6 +18,7 @@ pub mod header;
 pub mod index;
 pub mod key;
 pub mod listing;
+mod live;
 pub mod path;
 pub mod pax;
 pub mod stream;
@@ -26,7 +27,7 @@ pub mod walker;
 mod xz;
 mod zstd;
 
-pub use archive::{Archive, OpenOptions, Progress};
+pub use archive::{Archive, Indexing, OpenOptions, Progress};
 pub use codec::Codec;
 pub use entry::{Entry, EntryKind, SparseChunk};
 pub use error::{Error, Result};

@@ -12,8 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 
@@ -22,6 +21,7 @@ use crate::entry::{decode_sparse, encode_sparse, Entry, EntryKind};
 use crate::error::{Error, Result};
 use crate::gzip::{Checkpoint, Point};
 use crate::key::ArchiveKey;
+use crate::live::Live;
 use crate::path::parent;
 
 pub const FORMAT_VERSION: i64 = 2;
@@ -89,21 +89,49 @@ pub fn default_index_dir() -> PathBuf {
 /// Assigns ids, synthesises missing parent directories, links parents and
 /// marks members replaced by a later member with the same path.
 pub fn build_tree(members: Vec<Entry>) -> Vec<Entry> {
-    let mut out: Vec<Entry> = Vec::with_capacity(members.len());
-    let mut latest: HashMap<Vec<u8>, usize> = HashMap::with_capacity(members.len());
+    let mut t = TreeBuilder::with_capacity(members.len());
     for e in members {
+        t.push(e, |_, _| {});
+    }
+    t.link_parents();
+    t.out
+}
+
+/// Builds the entry table one member at a time, so that it can be read
+/// while the archive is still being indexed. Entries keep the ids they get
+/// here: the finished table is exactly what [`build_tree`] makes.
+#[derive(Default)]
+pub(crate) struct TreeBuilder {
+    pub(crate) out: Vec<Entry>,
+    /// Path -> its current (last) entry.
+    pub(crate) latest: HashMap<Vec<u8>, usize>,
+}
+
+impl TreeBuilder {
+    fn with_capacity(n: usize) -> TreeBuilder {
+        TreeBuilder {
+            out: Vec::with_capacity(n),
+            latest: HashMap::with_capacity(n),
+        }
+    }
+
+    /// Adds a member after any parent directories it lacks. `added` is
+    /// told each new entry's position and the position of the entry it
+    /// replaced, if any.
+    pub(crate) fn push(&mut self, mut e: Entry, mut added: impl FnMut(usize, Option<usize>)) {
         // Make sure every ancestor exists.
         let mut missing: Vec<Vec<u8>> = Vec::new();
         let mut p = parent(&e.path);
-        while !p.is_empty() && !latest.contains_key(p) {
+        while !p.is_empty() && !self.latest.contains_key(p) {
             missing.push(p.to_vec());
             p = parent(p);
         }
         for dir in missing.into_iter().rev() {
-            latest.insert(dir.clone(), out.len());
-            out.push(Entry {
-                id: 0,
-                parent_id: 0,
+            let i = self.out.len();
+            self.latest.insert(dir.clone(), i);
+            self.out.push(Entry {
+                id: i as i64 + 1,
+                parent_id: self.parent_id(&dir),
                 path: dir,
                 raw_name: Vec::new(),
                 typeflag: crate::header::DIRTYPE,
@@ -125,28 +153,59 @@ pub fn build_tree(members: Vec<Entry>) -> Vec<Entry> {
                 implicit: true,
                 superseded: false,
             });
+            added(i, None);
         }
-        if let Some(prev) = latest.insert(e.path.clone(), out.len()) {
-            out[prev].superseded = true;
-        }
-        out.push(e);
-    }
-    for (i, e) in out.iter_mut().enumerate() {
+        let i = self.out.len();
         e.id = i as i64 + 1;
-        let p = parent(&e.path);
-        e.parent_id = if e.path.is_empty() || p.is_empty() {
+        e.parent_id = self.parent_id(&e.path);
+        let prev = self.latest.insert(e.path.clone(), i);
+        if let Some(prev) = prev {
+            self.out[prev].superseded = true;
+        }
+        self.out.push(e);
+        added(i, prev);
+    }
+
+    /// The id of the current entry for the parent of `path` (0: the root).
+    pub(crate) fn parent_id(&self, path: &[u8]) -> i64 {
+        let p = parent(path);
+        if path.is_empty() || p.is_empty() {
             0
         } else {
-            latest.get(p).map(|&j| j as i64 + 1).unwrap_or(0)
-        };
+            self.latest.get(p).map_or(0, |&j| j as i64 + 1)
+        }
     }
-    out
+
+    /// Points every entry at the final entry of its parent directory (a
+    /// directory can be replaced by a later member after its children).
+    pub(crate) fn link_parents(&mut self) {
+        for i in 0..self.out.len() {
+            let id = self.parent_id(&self.out[i].path);
+            self.out[i].parent_id = id;
+        }
+    }
 }
 
-/// An open index. Safe to share between threads: each query borrows a
-/// read-only connection from a small pool (opening another one when all are
-/// busy), so callbacks may query the index again.
+/// An open index. Safe to share between threads.
+///
+/// Usually it is an index file. While an archive is indexed in the
+/// background it is the table built so far, kept in memory, and becomes the
+/// file once that is written; ids stay the same.
 pub struct Index {
+    path: PathBuf,
+    backend: RwLock<Backend>,
+}
+
+#[derive(Clone)]
+enum Backend {
+    Db(Arc<Db>),
+    Live(Arc<Live>),
+}
+
+/// An index file. Each query borrows a read-only connection from a small
+/// pool (opening another one when all are busy), so callbacks may query the
+/// index again.
+struct Db {
     pool: Mutex<Vec<Connection>>,
     path: PathBuf,
     /// The `meta` table as first opened. A connection opened later must see
@@ -158,7 +217,7 @@ pub struct Index {
 /// A pooled connection, returned to the pool on drop.
 struct Conn<'a> {
     conn: Option<Connection>,
-    index: &'a Index,
+    db: &'a Db,
 }
 
 impl std::ops::Deref for Conn<'_> {
@@ -170,7 +229,7 @@ impl std::ops::Deref for Conn<'_> {
 
 impl Drop for Conn<'_> {
     fn drop(&mut self) {
-        if let (Some(c), Ok(mut pool)) = (self.conn.take(), self.index.pool.lock()) {
+        if let (Some(c), Ok(mut pool)) = (self.conn.take(), self.db.pool.lock()) {
             if pool.len() < 16 {
                 pool.push(c);
             }
@@ -304,31 +363,40 @@ impl Index {
         let conn = open_read_only(path)?;
         let meta = read_meta(&conn)?;
         Ok(Index {
-            pool: Mutex::new(vec![conn]),
             path: path.to_path_buf(),
-            meta,
+            backend: RwLock::new(Backend::Db(Arc::new(Db {
+                pool: Mutex::new(vec![conn]),
+                path: path.to_path_buf(),
+                meta,
+            }))),
         })
     }
 
-    fn conn(&self) -> Result<Conn<'_>> {
-        let pooled = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop();
-        let conn = match pooled {
-            Some(c) => c,
-            None => {
-                let c = open_read_only(&self.path)?;
-                if read_meta(&c)? != self.meta {
-                    return Err(Error::StaleIndex {
-                        path: self.path.display().to_string(),
-                        reason: "the index file was replaced while in use".into(),
-                    });
-                }
-                c
-            }
-        };
-        Ok(Conn {
-            conn: Some(conn),
-            index: self,
-        })
+    /// An index served from a table still being built; it becomes the
+    /// file at `path` through [`Index::replace`].
+    pub(crate) fn live(path: &Path, live: Arc<Live>) -> Index {
+        Index {
+            path: path.to_path_buf(),
+            backend: RwLock::new(Backend::Live(live)),
+        }
+    }
+
+    /// Switches to serving from `other` (the finished index file).
+    pub(crate) fn replace(&self, other: Index) {
+        let b = other.backend();
+        *self.backend.write().unwrap_or_else(|e| e.into_inner()) = b;
+    }
+
+    fn backend(&self) -> Backend {
+        self.backend
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// True while the index is still being built.
+    pub fn is_live(&self) -> bool {
+        matches!(self.backend(), Backend::Live(_))
     }
 
     /// Opens an index and checks that it belongs to the archive described by `key`.
@@ -365,6 +433,128 @@ impl Index {
 
     /// All decoder restart points, in stream order (windows not loaded).
     pub fn checkpoints(&self) -> Result<Vec<Point>> {
+        match self.backend() {
+            Backend::Db(d) => d.checkpoints(),
+            Backend::Live(l) => Ok(l.points()),
+        }
+    }
+
+    /// The packed window stored with the checkpoint at `uncompressed_offset`.
+    pub fn checkpoint_window(&self, uncompressed_offset: u64) -> Result<Vec<u8>> {
+        match self.backend() {
+            Backend::Db(d) => d.checkpoint_window(uncompressed_offset),
+            Backend::Live(l) => l.window(uncompressed_offset),
+        }
+    }
+
+    /// Whether some checkpoint's state is not exactly `len` bytes long.
+    pub fn checkpoint_state_len_differs(&self, len: usize) -> Result<bool> {
+        match self.backend() {
+            Backend::Db(d) => d.checkpoint_state_len_differs(len),
+            Backend::Live(l) => Ok(l.state_len_differs(len)),
+        }
+    }
+
+    /// A value from the index file's `meta` table (none while live).
+    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+        match self.backend() {
+            Backend::Db(d) => d.meta(key),
+            Backend::Live(_) => Ok(None),
+        }
+    }
+
+    /// Visits every archive member (not synthesised directories) in archive order.
+    pub fn for_each_member(&self, f: impl FnMut(Entry) -> Result<()>) -> Result<()> {
+        match self.backend() {
+            Backend::Db(d) => d.for_each_member(f),
+            Backend::Live(l) => l.for_each_member(f),
+        }
+    }
+
+    pub fn get(&self, id: i64) -> Result<Option<Entry>> {
+        match self.backend() {
+            Backend::Db(d) => d.get(id),
+            Backend::Live(l) => Ok(l.get(id)),
+        }
+    }
+
+    /// Current (non-superseded) entry for a normalised path.
+    pub fn lookup(&self, path: &[u8]) -> Result<Option<Entry>> {
+        match self.backend() {
+            Backend::Db(d) => d.lookup(path),
+            Backend::Live(l) => Ok(l.lookup(path)),
+        }
+    }
+
+    /// The latest member with this path that precedes member `before`,
+    /// including superseded ones. Hard links refer to data that was
+    /// archived before them, even when the link reuses the same path.
+    pub fn lookup_before(&self, path: &[u8], before: i64) -> Result<Option<Entry>> {
+        match self.backend() {
+            Backend::Db(d) => d.lookup_before(path, before),
+            Backend::Live(l) => Ok(l.lookup_before(path, before)),
+        }
+    }
+
+    /// Current children of a directory (0 = archive root), sorted by name.
+    pub fn children(&self, dir_id: i64) -> Result<Vec<Entry>> {
+        match self.backend() {
+            Backend::Db(d) => d.children(dir_id),
+            Backend::Live(l) => Ok(l.children(dir_id)),
+        }
+    }
+
+    /// Up to `max` entries with ids above `after`, in id order (archive
+    /// order, synthesised directories just before their first child).
+    pub fn entries_after(&self, after: i64, max: usize) -> Result<Vec<Entry>> {
+        match self.backend() {
+            Backend::Db(d) => d.entries_after(after, max),
+            Backend::Live(l) => Ok(l.entries_after(after, max)),
+        }
+    }
+
+    /// Changes whenever the children of directory `dir_id` may have
+    /// changed (always the same once the index is finished).
+    pub fn dir_stamp(&self, dir_id: i64) -> u64 {
+        match self.backend() {
+            Backend::Db(_) => u64::MAX,
+            Backend::Live(l) => l.dir_stamp(dir_id),
+        }
+    }
+
+    #[cfg(test)]
+    fn db(&self) -> Arc<Db> {
+        match self.backend() {
+            Backend::Db(d) => d,
+            Backend::Live(_) => unreachable!("a live index"),
+        }
+    }
+}
+
+impl Db {
+    fn conn(&self) -> Result<Conn<'_>> {
+        let pooled = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop();
+        let conn = match pooled {
+            Some(c) => c,
+            None => {
+                let c = open_read_only(&self.path)?;
+                if read_meta(&c)? != self.meta {
+                    return Err(Error::StaleIndex {
+                        path: self.path.display().to_string(),
+                        reason: "the index file was replaced while in use".into(),
+                    });
+                }
+                c
+            }
+        };
+        Ok(Conn {
+            conn: Some(conn),
+            db: self,
+        })
+    }
+
+    /// All decoder restart points, in stream order (windows not loaded).
+    fn checkpoints(&self) -> Result<Vec<Point>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare_cached(
             "SELECT uncompressed_offset, compressed_bit_offset FROM checkpoints \
@@ -389,7 +579,7 @@ impl Index {
     }
 
     /// The packed window stored with the checkpoint at `uncompressed_offset`.
-    pub fn checkpoint_window(&self, uncompressed_offset: u64) -> Result<Vec<u8>> {
+    fn checkpoint_window(&self, uncompressed_offset: u64) -> Result<Vec<u8>> {
         Ok(self.conn()?.query_row(
             "SELECT state FROM checkpoints WHERE uncompressed_offset = ?1",
             [uncompressed_offset as i64],
@@ -398,7 +588,7 @@ impl Index {
     }
 
     /// Whether some checkpoint's state is not exactly `len` bytes long.
-    pub fn checkpoint_state_len_differs(&self, len: usize) -> Result<bool> {
+    fn checkpoint_state_len_differs(&self, len: usize) -> Result<bool> {
         Ok(self.conn()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM checkpoints \
              WHERE state IS NULL OR length(state) != ?1)",
@@ -407,7 +597,7 @@ impl Index {
         )?)
     }
 
-    pub fn meta(&self, key: &str) -> Result<Option<String>> {
+    fn meta(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .conn()?
             .query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
@@ -415,7 +605,7 @@ impl Index {
     }
 
     /// Visits every archive member (not synthesised directories) in archive order.
-    pub fn for_each_member(&self, mut f: impl FnMut(Entry) -> Result<()>) -> Result<()> {
+    fn for_each_member(&self, mut f: impl FnMut(Entry) -> Result<()>) -> Result<()> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT {COLUMNS} FROM entries WHERE implicit = 0 ORDER BY id"
@@ -427,7 +617,7 @@ impl Index {
         Ok(())
     }
 
-    pub fn get(&self, id: i64) -> Result<Option<Entry>> {
+    fn get(&self, id: i64) -> Result<Option<Entry>> {
         Ok(self
             .conn()?
             .query_row(
@@ -439,7 +629,7 @@ impl Index {
     }
 
     /// Current (non-superseded) entry for a normalised path.
-    pub fn lookup(&self, path: &[u8]) -> Result<Option<Entry>> {
+    fn lookup(&self, path: &[u8]) -> Result<Option<Entry>> {
         Ok(self
             .conn()?
             .query_row(
@@ -453,7 +643,7 @@ impl Index {
     /// The latest member with this path that precedes member `before`,
     /// including superseded ones. Hard links refer to data that was
     /// archived before them, even when the link reuses the same path.
-    pub fn lookup_before(&self, path: &[u8], before: i64) -> Result<Option<Entry>> {
+    fn lookup_before(&self, path: &[u8], before: i64) -> Result<Option<Entry>> {
         Ok(self
             .conn()?
             .query_row(
@@ -467,12 +657,21 @@ impl Index {
     }
 
     /// Current children of a directory (0 = archive root), sorted by name.
-    pub fn children(&self, dir_id: i64) -> Result<Vec<Entry>> {
+    fn children(&self, dir_id: i64) -> Result<Vec<Entry>> {
         let conn = self.conn()?;
         let mut stmt = conn.prepare_cached(&format!(
             "SELECT {COLUMNS} FROM entries WHERE parent_id = ?1 AND superseded = 0 AND path <> x'' ORDER BY name"
         ))?;
         let rows = stmt.query_map([dir_id], row_to_entry)?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    fn entries_after(&self, after: i64, max: usize) -> Result<Vec<Entry>> {
+        let conn = self.conn()?;
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT {COLUMNS} FROM entries WHERE id > ?1 ORDER BY id LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![after, max as i64], row_to_entry)?;
         Ok(rows.collect::<Result<Vec<_>, _>>()?)
     }
 }
@@ -562,8 +761,9 @@ mod tests {
         let generation = idx.meta("generation").unwrap().unwrap();
         // Another archive, then the same archive again (equal metadata, but
         // its checkpoints could differ): neither may be mixed in.
+        let db = idx.db();
         for size in [20, 10] {
-            let busy = idx.conn().unwrap();
+            let busy = db.conn().unwrap();
             let replaced = Index::create(&path, &key(size), Codec::None, 0, &[], &[]);
             // Unix lets a rebuild rename over an open index, so the
             // replacement really happens there; Windows refuses it.

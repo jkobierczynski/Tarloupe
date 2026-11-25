@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use tarloupe_core::{Archive, OpenOptions, Progress};
+use tarloupe_core::{Archive, Indexing, OpenOptions, Progress};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
     GetLastError, ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, HANDLE, WAIT_ABANDONED, WAIT_OBJECT_0,
@@ -34,6 +34,7 @@ pub struct Options {
     /// Set to unmount now, even if something is still open.
     pub stop: Arc<AtomicBool>,
     /// Told how far indexing has got, if the archive has to be indexed.
+    /// Indexing goes on after the archive is mounted.
     pub progress: Option<Progress>,
 }
 
@@ -143,21 +144,20 @@ fn serve(
     mounted: &mut impl FnMut(&OsStr),
 ) -> Result<()> {
     let stop = &opts.stop;
-    let a = match Archive::open(
-        path,
-        &OpenOptions {
-            progress: opts.progress.clone(),
-            cancel: Some(stop.clone()),
-            ..Default::default()
-        },
-    ) {
-        Err(tarloupe_core::Error::Cancelled) => return Ok(()),
-        r => r.with_context(|| format!("cannot open {}", path.display()))?,
-    };
-    if stop.load(Ordering::Relaxed) {
-        return Ok(()); // asked to stop just as indexing finished
-    }
-    let m = tarloupe_winfsp::mount(Arc::new(a), None)?;
+    // Mounted at once: when the archive has to be indexed, its members
+    // appear in the window as indexing finds them.
+    let a = Arc::new(
+        Archive::open_live(
+            path,
+            &OpenOptions {
+                progress: opts.progress.clone(),
+                cancel: Some(stop.clone()),
+                ..Default::default()
+            },
+        )
+        .with_context(|| format!("cannot open {}", path.display()))?,
+    );
+    let m = tarloupe_winfsp::mount(a.clone(), None)?;
     if stop.load(Ordering::Relaxed) {
         return Ok(()); // asked to stop while waiting to mount
     }
@@ -171,10 +171,26 @@ fn serve(
         open_window(&point)?;
     }
     // An Explorer window keeps its folder open, so the idle clock only
-    // runs once every window and file on the mount is closed.
-    let started = Instant::now();
+    // runs once every window and file on the mount is closed, and indexing
+    // is done: stopping it halfway would waste the work.
+    let mut started = Instant::now();
+    let mut indexing = true;
     while !stop.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(500));
+        if indexing {
+            match a.indexing() {
+                Indexing::Running => continue,
+                Indexing::Done => {
+                    indexing = false;
+                    started = Instant::now();
+                }
+                Indexing::Failed(_) if stop.load(Ordering::Relaxed) => break,
+                Indexing::Failed(why) => {
+                    drop(m);
+                    bail!("cannot index {}: {why}", path.display());
+                }
+            }
+        }
         if m.open_handles() == 0 && m.idle_for() >= opts.idle && started.elapsed() >= opts.idle {
             break;
         }

@@ -69,6 +69,8 @@ impl Node {
 pub struct Listing {
     pub entries: Vec<(String, Node)>,
     by_fold: HashMap<String, usize>,
+    /// The directory's [`crate::index::Index::dir_stamp`] when it was listed.
+    stamp: u64,
 }
 
 impl Listing {
@@ -184,15 +186,21 @@ impl Vfs {
     /// The children of a directory node.
     pub fn list(&self, dir: &Node) -> Result<Arc<Listing>> {
         let key = dir.dir_id();
+        // While the archive is indexed in the background, directories
+        // grow: a listing is good while the stamp it was made at holds.
+        let stamp = self.archive.index().dir_stamp(key);
         if let Some(l) = self
             .cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(key)
+            .filter(|l| l.stamp == stamp)
         {
             return Ok(l);
         }
-        let listing = Arc::new(self.build_listing(key)?);
+        let mut listing = self.build_listing(key)?;
+        listing.stamp = stamp;
+        let listing = Arc::new(listing);
         self.cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -298,6 +306,21 @@ pub fn fold(name: &str) -> String {
 
 fn private(c: u32) -> char {
     char::from_u32(0xF000 + c).unwrap()
+}
+
+/// The Windows path (`\\dir\\file`) of an archive path, as the view
+/// shows it: each component through [`windows_name`], but without the
+/// ` (2)` suffixes that set apart names equal but for case.
+pub fn windows_path(path: &[u8]) -> String {
+    let mut out = String::new();
+    for comp in path.split(|&c| c == b'/').filter(|c| !c.is_empty()) {
+        out.push('\\');
+        out.push_str(&windows_name(comp));
+    }
+    if out.is_empty() {
+        out.push('\\');
+    }
+    out
 }
 
 /// Maps a tar name (bytes) to a legal Windows name.
@@ -406,6 +429,7 @@ mod tests {
         Arc::new(Listing {
             entries: (0..n).map(|i| (i.to_string(), node.clone())).collect(),
             by_fold: HashMap::new(),
+            stamp: 0,
         })
     }
 

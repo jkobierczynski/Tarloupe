@@ -148,10 +148,12 @@ struct Job {
     again: bool,
 }
 
-#[derive(Clone)]
-enum State {
-    Indexing(u8),
-    Mounted(OsString),
+/// An archive is mounted at once and may go on indexing for a while.
+#[derive(Clone, Default)]
+struct State {
+    mounted: Option<OsString>,
+    /// Percent indexed, while indexing.
+    indexing: Option<u8>,
 }
 
 struct Agent {
@@ -195,7 +197,7 @@ impl Agent {
             }
             // Clicked again: open another window once it is mounted. While
             // it is still indexing, the window it opens then is enough.
-            if let (State::Mounted(p), true) = (&j.state, self.settings.open_window) {
+            if let (Some(p), true) = (&j.state.mounted, self.settings.open_window) {
                 let _ = browse::open_window(p);
             }
             return true;
@@ -209,7 +211,10 @@ impl Agent {
         jobs.push(Job {
             id,
             path: path.clone(),
-            state: State::Indexing(0),
+            state: State {
+                mounted: None,
+                indexing: Some(0),
+            },
             stop: stop.clone(),
             again: false,
         });
@@ -219,7 +224,7 @@ impl Agent {
         std::thread::spawn(move || {
             let progress: tarloupe_core::Progress = Arc::new(move |done, total| {
                 let pct = (done.saturating_mul(100) / total.max(1)).min(100) as u8;
-                self.set_state(id, State::Indexing(pct));
+                self.update(id, |s| s.indexing = (pct < 100).then_some(pct));
             });
             let opts = browse::Options {
                 idle: self.settings.idle,
@@ -228,7 +233,7 @@ impl Agent {
                 progress: Some(progress),
             };
             let r = browse::browse(&path, &opts, |point| {
-                self.set_state(id, State::Mounted(point.to_os_string()))
+                self.update(id, |s| s.mounted = Some(point.to_os_string()))
             });
             let again = {
                 let mut jobs = self.jobs.lock().unwrap();
@@ -249,9 +254,9 @@ impl Agent {
         true
     }
 
-    fn set_state(&self, id: usize, state: State) {
+    fn update(&self, id: usize, f: impl FnOnce(&mut State)) {
         if let Some(j) = self.jobs.lock().unwrap().iter_mut().find(|j| j.id == id) {
-            j.state = state;
+            f(&mut j.state);
         }
         self.refresh();
     }
@@ -334,7 +339,7 @@ impl Agent {
             }
             for (id, text, state) in &jobs {
                 let Ok(sub) = CreatePopupMenu() else { continue };
-                let open = if matches!(state, State::Mounted(_)) {
+                let open = if state.mounted.is_some() {
                     MF_STRING
                 } else {
                     MF_STRING | MF_GRAYED
@@ -378,13 +383,13 @@ impl Agent {
         let (id, unmount) = ((cmd - CMD_JOB) / 2, (cmd - CMD_JOB) % 2 == 1);
         if unmount {
             self.stop(Some(id));
-        } else if let Some(State::Mounted(p)) = self
+        } else if let Some(p) = self
             .jobs
             .lock()
             .unwrap()
             .iter()
             .find(|j| j.id == id)
-            .map(|j| j.state.clone())
+            .and_then(|j| j.state.mounted.clone())
         {
             let _ = browse::open_window(&p);
         }
@@ -418,9 +423,11 @@ fn describe(j: &Job) -> String {
         || j.path.display().to_string(),
         |n| n.to_string_lossy().into(),
     );
-    match &j.state {
-        State::Indexing(pct) => format!("{name}: indexing {pct}%"),
-        State::Mounted(p) => format!("{name}: {}", p.to_string_lossy()),
+    match (&j.state.mounted, j.state.indexing) {
+        (None, Some(pct)) => format!("{name}: indexing {pct}%"),
+        (None, None) => format!("{name}: opening"),
+        (Some(p), Some(pct)) => format!("{name}: {} (indexing {pct}%)", p.to_string_lossy()),
+        (Some(p), None) => format!("{name}: {}", p.to_string_lossy()),
     }
 }
 
