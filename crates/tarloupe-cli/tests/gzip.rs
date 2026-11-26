@@ -375,3 +375,37 @@ fn cancelling_stops_indexing_and_leaves_no_index() {
         open(path, &idx, 1 << 20);
     }
 }
+
+#[test]
+fn parallel_first_pass_reads_like_the_plain_tar() {
+    // Large enough for several 4 MiB chunks, so that most chunks start in
+    // the middle of the deflate stream.
+    let dir = tempfile::tempdir().unwrap();
+    let mut tar = Vec::new();
+    write_bulk(&mut tar, Format::Gnu, 28 << 20, 5).unwrap();
+    let tar_path = dir.path().join("p.tar");
+    fs::write(&tar_path, &tar).unwrap();
+    let plain = open(&tar_path, &dir.path().join("plain"), 1 << 20);
+    for (name, data) in [
+        ("level6", gzip(&tar, 6, None).unwrap()),
+        ("members", gzip(&tar, 6, Some(3_000_000)).unwrap()),
+    ] {
+        assert!(data.len() > 8 << 20, "{name}: only {} bytes", data.len());
+        let path = dir.path().join(format!("{name}.tar.gz"));
+        fs::write(&path, &data).unwrap();
+        for threads in [1, 3] {
+            let a = Archive::open(
+                &path,
+                &OpenOptions {
+                    index_dir: Some(dir.path().join(format!("{name}-{threads}"))),
+                    checkpoint_spacing: Some(1 << 20),
+                    threads: Some(threads),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(a.stream_size(), Some(tar.len() as u64));
+            assert_same(&plain, &a, threads as u64);
+        }
+    }
+}

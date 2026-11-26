@@ -384,19 +384,139 @@ impl Input {
     }
 }
 
+/// One positional read, retried when interrupted.
 pub(crate) fn read_at(file: &std::fs::File, buf: &mut [u8], off: u64) -> io::Result<usize> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        file.read_at(buf, off)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::FileExt;
-        file.seek_read(buf, off)
+    loop {
+        #[cfg(unix)]
+        let r = {
+            use std::os::unix::fs::FileExt;
+            file.read_at(buf, off)
+        };
+        #[cfg(windows)]
+        let r = {
+            use std::os::windows::fs::FileExt;
+            file.seek_read(buf, off)
+        };
+        match r {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            r => return r,
+        }
     }
 }
 
 pub(crate) fn invalid(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
+}
+
+/// Runs `work(0)`, `work(1)`, ... on worker threads and hands the results
+/// out in order. Workers stay at most `window` items ahead of the item
+/// being waited for, which bounds the memory held by finished results.
+pub(crate) struct Ordered<T: Send + 'static> {
+    shared: Arc<OrderedShared<T>>,
+    workers: Vec<std::thread::JoinHandle<()>>,
+    items: u64,
+    take: u64,
+}
+
+struct OrderedQueue<T> {
+    next: u64,
+    wanted: u64,
+    done: std::collections::BTreeMap<u64, T>,
+}
+
+struct OrderedShared<T> {
+    queue: Mutex<OrderedQueue<T>>,
+    cv: std::sync::Condvar,
+    stop: AtomicBool,
+}
+
+impl<T: Send + 'static> Ordered<T> {
+    pub fn new(
+        items: u64,
+        threads: usize,
+        window: u64,
+        work: impl Fn(u64) -> T + Send + Sync + 'static,
+    ) -> io::Result<Ordered<T>> {
+        let shared = Arc::new(OrderedShared {
+            queue: Mutex::new(OrderedQueue {
+                next: 0,
+                wanted: 0,
+                done: std::collections::BTreeMap::new(),
+            }),
+            cv: std::sync::Condvar::new(),
+            stop: AtomicBool::new(false),
+        });
+        let work = Arc::new(work);
+        let window = window.max(1);
+        let mut ordered = Ordered {
+            shared: shared.clone(),
+            workers: Vec::new(),
+            items,
+            take: 0,
+        };
+        for _ in 0..threads.max(1).min(items.max(1) as usize) {
+            let (shared, work) = (shared.clone(), work.clone());
+            let w = std::thread::Builder::new().spawn(move || loop {
+                let k = {
+                    let mut q = shared.queue.lock().unwrap();
+                    loop {
+                        if shared.stop.load(Ordering::Relaxed) || q.next >= items {
+                            return;
+                        }
+                        if q.next < q.wanted + window {
+                            break;
+                        }
+                        q = shared.cv.wait(q).unwrap();
+                    }
+                    q.next += 1;
+                    q.next - 1
+                };
+                let r = work(k);
+                shared.queue.lock().unwrap().done.insert(k, r);
+                shared.cv.notify_all();
+            });
+            // On failure, dropping `ordered` stops the workers started so far.
+            ordered.workers.push(w?);
+        }
+        Ok(ordered)
+    }
+
+    /// Index of the item [`Ordered::next`] returns next.
+    pub fn position(&self) -> u64 {
+        self.take
+    }
+
+    /// Waits for the next item in order; `None` once all were returned.
+    pub fn next(&mut self) -> Option<T> {
+        if self.take >= self.items {
+            return None;
+        }
+        let k = self.take;
+        let mut q = self.shared.queue.lock().unwrap();
+        q.wanted = k;
+        self.shared.cv.notify_all();
+        let r = loop {
+            if let Some(r) = q.done.remove(&k) {
+                break r;
+            }
+            q = self.shared.cv.wait(q).unwrap();
+        };
+        self.take += 1;
+        Some(r)
+    }
+}
+
+impl<T: Send + 'static> Drop for Ordered<T> {
+    fn drop(&mut self) {
+        {
+            // Under the lock, so no worker can miss the wake-up between
+            // checking `stop` and waiting.
+            let _q = self.shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            self.shared.stop.store(true, Ordering::Relaxed);
+            self.shared.cv.notify_all();
+        }
+        for w in self.workers.drain(..) {
+            let _ = w.join();
+        }
+    }
 }
