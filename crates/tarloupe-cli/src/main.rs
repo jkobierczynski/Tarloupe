@@ -148,6 +148,10 @@ enum Cmd {
         /// Where to mount: a free drive letter such as `T:`, or a folder path
         /// that does not exist yet (default: the last free drive letter).
         mount_point: Option<OsString>,
+        /// When the archive has to be indexed, mount it at once and let its
+        /// members appear as indexing finds them (instead of waiting).
+        #[arg(long)]
+        live: bool,
         #[command(flatten)]
         idx: IndexOpts,
     },
@@ -168,8 +172,8 @@ enum ExplorerAction {
     Uninstall,
 }
 
-fn open(archive: &PathBuf, idx: &IndexOpts, rebuild: bool) -> Result<Archive> {
-    let opts = OpenOptions {
+fn open_options(idx: &IndexOpts, rebuild: bool) -> OpenOptions {
+    OpenOptions {
         index_path: idx.index.clone(),
         index_dir: idx.index_dir.clone(),
         rebuild,
@@ -178,7 +182,11 @@ fn open(archive: &PathBuf, idx: &IndexOpts, rebuild: bool) -> Result<Archive> {
         progress: None,
         cancel: None,
         threads: idx.index_threads.filter(|&n| n > 0),
-    };
+    }
+}
+
+fn open(archive: &PathBuf, idx: &IndexOpts, rebuild: bool) -> Result<Archive> {
+    let opts = open_options(idx, rebuild);
     let start = Instant::now();
     let a = Archive::open(archive, &opts)
         .with_context(|| format!("cannot open {}", archive.display()))?;
@@ -466,6 +474,7 @@ fn run(cli: Cli) -> Result<()> {
         Cmd::Mount {
             archive,
             mount_point,
+            live,
             idx,
         } => {
             // Say so before spending time on indexing.
@@ -474,8 +483,13 @@ fn run(cli: Cli) -> Result<()> {
                     "mount is only available on Windows (with WinFsp); use ls, cat or extract"
                 );
             }
-            let a = open(&archive, &idx, false)?;
-            mount(a, mount_point)?;
+            let a = if live {
+                Archive::open_live(&archive, &open_options(&idx, false))
+                    .with_context(|| format!("cannot open {}", archive.display()))?
+            } else {
+                open(&archive, &idx, false)?
+            };
+            mount(a, mount_point, live)?;
         }
     }
     out.flush()?;
@@ -532,25 +546,51 @@ fn explorer(_action: ExplorerAction) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn mount(a: Archive, point: Option<OsString>) -> Result<()> {
+fn mount(a: Archive, point: Option<OsString>, live: bool) -> Result<()> {
     use std::sync::{mpsc, Arc};
     let (tx, rx) = mpsc::channel();
     ctrlc::set_handler(move || {
         let _ = tx.send(());
     })
     .context("cannot install the Ctrl+C handler")?;
-    let m = tarloupe_winfsp::mount(Arc::new(a), point.as_deref())?;
+    let a = Arc::new(a);
+    let m = tarloupe_winfsp::mount(a.clone(), point.as_deref())?;
     // Scripts (and the tests) wait for this line before using the mount.
     println!("{}", m.mount_point().to_string_lossy());
     io::stdout().flush()?;
     eprintln!("tarloupe: mounted read-only; press Ctrl+C to unmount");
-    let _ = rx.recv();
+    // Built in the background, maybe already done: say when it is.
+    let mut indexing = live && a.index_status() != IndexStatus::Loaded;
+    if indexing {
+        eprintln!("tarloupe: indexing; members appear as they are found");
+    }
+    while let Err(mpsc::RecvTimeoutError::Timeout) =
+        rx.recv_timeout(std::time::Duration::from_millis(250))
+    {
+        if indexing {
+            match a.indexing() {
+                tarloupe_core::Indexing::Running => {}
+                tarloupe_core::Indexing::Done => {
+                    indexing = false;
+                    eprintln!("tarloupe: indexed -> {}", a.index_path().display());
+                    warn_if_slow(&a);
+                }
+                tarloupe_core::Indexing::Failed(why) => {
+                    indexing = false;
+                    eprintln!(
+                        "tarloupe: indexing failed, only part of the archive is shown: {}",
+                        escape_controls(&why)
+                    );
+                }
+            }
+        }
+    }
     drop(m);
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn mount(_a: Archive, _point: Option<OsString>) -> Result<()> {
+fn mount(_a: Archive, _point: Option<OsString>, _live: bool) -> Result<()> {
     unreachable!("checked before opening the archive")
 }
 

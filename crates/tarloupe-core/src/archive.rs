@@ -4,14 +4,16 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 use crate::codec::Codec;
 use crate::entry::{Entry, EntryKind};
 use crate::error::{Error, Result};
-use crate::gzip::{self, IndexingReader};
+use crate::gzip::{self, Checkpoint, IndexingReader};
 use crate::index::{build_tree, default_index_dir, Index};
 use crate::key::ArchiveKey;
+use crate::live::Live;
 use crate::path::{normalize, resolve_link};
 use crate::stream::{self, Decoder, Indexer, Opener, Point, RandomReader};
 use crate::walker::{ReadSource, SeekSource, Walker};
@@ -63,7 +65,9 @@ impl std::fmt::Debug for OpenOptions {
     }
 }
 
-/// What [`Archive::open`] did about the index.
+/// What [`Archive::open`] did about the index. With
+/// [`Archive::open_live`], `Built` and `Rebuilt` mean that building has
+/// started; [`Archive::indexing`] tells how it goes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexStatus {
     Loaded,
@@ -71,22 +75,67 @@ pub enum IndexStatus {
     Rebuilt,
 }
 
+/// Where building the index in the background stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Indexing {
+    /// The index is complete (or was never built in the background).
+    Done,
+    /// Members show up as they are found.
+    Running,
+    /// Building stopped; what was found so far can still be read.
+    Failed(String),
+}
+
 pub struct Archive {
     path: PathBuf,
     file: Arc<File>,
     codec: Codec,
-    index: Index,
+    index: Arc<Index>,
     status: IndexStatus,
     /// Decompresses the tar stream (`None` for a plain tar).
-    reader: Option<RandomReader>,
-    /// Restart points, in stream order.
-    points: Vec<Point>,
+    reader: Option<Arc<RandomReader>>,
+    /// The background build, for archives opened with [`Archive::open_live`].
+    building: Option<Building>,
+}
+
+struct Building {
+    cancel: Arc<AtomicBool>,
+    state: Arc<Mutex<Indexing>>,
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for Archive {
+    fn drop(&mut self) {
+        if let Some(b) = &self.building {
+            b.cancel.store(true, Ordering::Relaxed);
+            let t = b.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(t) = t {
+                let _ = t.join();
+            }
+        }
+    }
 }
 
 impl Archive {
     /// Opens an archive, loading its index or building it with one pass.
     pub fn open(path: impl AsRef<Path>, opts: &OpenOptions) -> Result<Archive> {
-        let path = path.as_ref().to_path_buf();
+        Self::open_with(path.as_ref(), opts, false)
+    }
+
+    /// Like [`Archive::open`], but when the index has to be built, returns
+    /// at once and builds it on a background thread. Meanwhile the archive
+    /// shows the members found so far: lookups, listings and reads work
+    /// on them, and later members appear as the build reaches them. Ids
+    /// never change, also not when the finished index file takes over.
+    ///
+    /// Dropping the archive stops the build. `opts.cancel` stops it too;
+    /// either way [`Archive::indexing`] then says it failed.
+    pub fn open_live(path: impl AsRef<Path>, opts: &OpenOptions) -> Result<Archive> {
+        Self::open_with(path.as_ref(), opts, true)
+    }
+
+    fn open_with(path: &Path, opts: &OpenOptions, live: bool) -> Result<Archive> {
+        let path = path.to_path_buf();
         let mut file = File::open(&path)?;
         let codec = detect(&mut file)?;
         // Key and index come from the handle we keep for reads, so they
@@ -114,51 +163,88 @@ impl Archive {
             )));
         }
 
-        let (index, status) = if !opts.rebuild && index_path.exists() {
+        let loaded = if !opts.rebuild && index_path.exists() {
             match Index::open(&index_path, &key).and_then(|i| {
                 load_points(&i, codec, file_size)?;
                 Ok(i)
             }) {
-                Ok(i) => (i, IndexStatus::Loaded),
+                Ok(i) => Some(i),
                 Err(e @ (Error::StaleIndex { .. } | Error::Sqlite(_))) if opts.require_index => {
                     return Err(e)
                 }
-                Err(Error::StaleIndex { .. }) | Err(Error::Sqlite(_)) => (
-                    build_index(&file, &index_path, &key, codec, spacing, opts)?,
-                    IndexStatus::Rebuilt,
-                ),
+                Err(Error::StaleIndex { .. }) | Err(Error::Sqlite(_)) => None,
                 Err(e) => return Err(e),
             }
         } else if opts.require_index && !opts.rebuild {
             return Err(Error::NotFound(format!("index {}", index_path.display())));
         } else {
-            let st = if index_path.exists() {
-                IndexStatus::Rebuilt
-            } else {
-                IndexStatus::Built
-            };
-            (
-                build_index(&file, &index_path, &key, codec, spacing, opts)?,
-                st,
-            )
+            None
+        };
+        let status = match (&loaded, index_path.exists()) {
+            (Some(_), _) => IndexStatus::Loaded,
+            (None, true) => IndexStatus::Rebuilt,
+            (None, false) => IndexStatus::Built,
+        };
+        let job = Job {
+            file: file.clone(),
+            index_path,
+            key,
+            codec,
+            spacing,
+            threads: opts.threads.unwrap_or_else(default_threads),
+            progress: opts.progress.clone(),
+            cancel: opts.cancel.clone(),
+        };
+        let index = match loaded {
+            Some(i) => i,
+            None if live => return job.start(path, status),
+            None => job.build(None, None)?,
         };
 
-        let (reader, points) = match opener(codec, &file) {
-            Some(o) => {
-                let points = load_points(&index, codec, file_size)?;
-                (Some(RandomReader::new(points.clone(), o)), points)
-            }
-            None => (None, Vec::new()),
+        let reader = match opener(codec, &file) {
+            Some(o) => Some(Arc::new(RandomReader::new(
+                load_points(&index, codec, file_size)?,
+                o,
+            ))),
+            None => None,
         };
         Ok(Archive {
             path,
             file,
             codec,
-            index,
+            index: Arc::new(index),
             status,
             reader,
-            points,
+            building: None,
         })
+    }
+
+    /// Where the background build stands (always `Done` for an archive
+    /// opened with [`Archive::open`]).
+    pub fn indexing(&self) -> Indexing {
+        match &self.building {
+            None => Indexing::Done,
+            Some(b) => b.state.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        }
+    }
+
+    /// Waits for the background build to end; fails if it failed.
+    pub fn wait_indexed(&self) -> Result<()> {
+        if let Some(b) = &self.building {
+            let t = b.thread.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(t) = t {
+                let _ = t.join();
+            }
+        }
+        match self.indexing() {
+            Indexing::Failed(why) => Err(Error::IndexingFailed(why)),
+            _ => Ok(()),
+        }
+    }
+
+    /// Restart points known so far.
+    fn points(&self) -> Vec<Point> {
+        self.reader.as_ref().map_or_else(Vec::new, |r| r.points())
     }
 
     pub fn path(&self) -> &Path {
@@ -197,15 +283,15 @@ impl Archive {
         // is chunk-aligned) starts at the restart point before `next`.
         // Without the stream size, the stream is only known to reach the
         // last restart point.
-        let known_end =
-            end.unwrap_or_else(|| self.points.last().map_or(0, |p| p.uncompressed_offset));
+        let points = self.points();
+        let known_end = end.unwrap_or_else(|| points.last().map_or(0, |p| p.uncompressed_offset));
         let reach = |next: u64| {
             let chunk_end = next.div_ceil(stream::CHUNK) * stream::CHUNK;
             chunk_end.min(known_end.max(next))
         };
         let mut prev = 0;
         let mut gap = 0;
-        for p in &self.points {
+        for p in &points {
             gap = gap.max(reach(p.uncompressed_offset).saturating_sub(prev));
             prev = p.uncompressed_offset;
         }
@@ -221,7 +307,7 @@ impl Archive {
         if self.max_decode_distance() <= SLOW_DISTANCE {
             return None;
         }
-        if !self.points.is_empty() {
+        if !self.points().is_empty() {
             return Some(
                 "parts of this archive lie far from any point where decoding can \
                  start, so reads there decode a long way first",
@@ -515,114 +601,289 @@ fn same_file(a: &Path, b: &Path) -> bool {
     matches!((canon(a), canon(b)), (Some(x), Some(y)) if x == y)
 }
 
-fn build_index(
-    file: &Arc<File>,
-    index_path: &Path,
-    key: &ArchiveKey,
+/// Everything building an index needs.
+struct Job {
+    file: Arc<File>,
+    index_path: PathBuf,
+    key: ArchiveKey,
     codec: Codec,
     spacing: u64,
-    opts: &OpenOptions,
-) -> Result<Index> {
-    let mut report = Reporter {
-        progress: opts.progress.as_ref(),
-        cancel: opts.cancel.as_deref(),
-        total: key.size,
-        last: 0,
-    };
-    report.start();
-    let walked = (|| -> Result<_> {
-        Ok(match codec {
-            Codec::Gzip => match opts.threads.unwrap_or_else(default_threads) {
-                1 => {
-                    let mut reader = IndexingReader::new(file.clone(), spacing)?;
-                    let members = walk_compressed(&mut reader, &mut report)?;
-                    let size = reader.position();
-                    (members, std::mem::take(&mut reader.checkpoints), size)
+    threads: usize,
+    progress: Option<Progress>,
+    cancel: Option<Arc<AtomicBool>>,
+}
+
+/// Takes members and restart points as indexing finds them.
+type Sink<'a> = dyn FnMut(Vec<Entry>, Vec<Checkpoint>) + 'a;
+
+impl Job {
+    /// Builds and writes the index. With `live`, members and restart
+    /// points go there (and to the reader) as they are found, and `stop`
+    /// stops the build.
+    fn build(
+        &self,
+        live: Option<(&Live, Option<&RandomReader>)>,
+        stop: Option<&Arc<AtomicBool>>,
+    ) -> Result<Index> {
+        let mut report = Reporter {
+            progress: self.progress.as_ref(),
+            cancel: [self.cancel.as_deref(), stop.map(|s| &**s)],
+            total: self.key.size,
+            last: 0,
+        };
+        report.start();
+        let mut members = Vec::new();
+        let mut checkpoints = Vec::new();
+        let walked = {
+            let mut sink = |m: Vec<Entry>, c: Vec<Checkpoint>| match live {
+                Some((l, reader)) => {
+                    if let Some(r) = reader {
+                        let points: Vec<Point> = c
+                            .iter()
+                            .map(|c| Point {
+                                uncompressed_offset: c.uncompressed_offset,
+                                bit_offset: c.bit_offset,
+                            })
+                            .collect();
+                        r.extend_points(&points);
+                    }
+                    l.push(m, c);
                 }
-                threads => {
-                    let mut reader = crate::gzip_par::ParallelIndexer::new(
-                        file.clone(),
-                        spacing,
-                        threads,
-                        opts.cancel.clone(),
-                    )?;
-                    let members = walk_compressed(&mut reader, &mut report)?;
-                    let size = reader.position();
-                    (members, std::mem::take(&mut reader.checkpoints), size)
+                None => {
+                    members.extend(m);
+                    checkpoints.extend(c);
                 }
-            },
+            };
+            let cancel = stop.cloned().or_else(|| self.cancel.clone());
+            self.walk(&mut report, cancel, &mut sink)
+        };
+        if report.cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let stream_size = walked?;
+        report.done();
+        if report.cancelled() {
+            return Err(Error::Cancelled); // cancelled just as it finished
+        }
+        // Refuse to publish an index if the file changed while it was read.
+        if ArchiveKey::from_file(&self.file)? != self.key {
+            return Err(Error::Unsupported(
+                "the archive changed while it was being indexed; try again".into(),
+            ));
+        }
+        // A zstd frame or xz block ending with the data is no use to
+        // resume from.
+        let keep = |c: &Checkpoint| {
+            !matches!(self.codec, Codec::Zstd | Codec::Xz) || c.uncompressed_offset < stream_size
+        };
+        let create = |entries: &[Entry], checkpoints: &[Checkpoint]| {
+            Index::create(
+                &self.index_path,
+                &self.key,
+                self.codec,
+                stream_size,
+                entries,
+                checkpoints,
+            )
+        };
+        match live {
+            None => {
+                checkpoints.retain(keep);
+                create(&build_tree(members), &checkpoints)
+            }
+            Some((l, _)) => l.finish(|entries, cps| {
+                let cps: Vec<Checkpoint> = cps.iter().filter(|c| keep(c)).cloned().collect();
+                create(entries, &cps)
+            }),
+        }
+    }
+
+    /// Opens the archive at once, building the index on a new thread.
+    fn start(self, path: PathBuf, status: IndexStatus) -> Result<Archive> {
+        let live = Arc::new(Live::default());
+        let index = Arc::new(Index::live(&self.index_path, live.clone()));
+        let reader =
+            opener(self.codec, &self.file).map(|o| Arc::new(RandomReader::new(Vec::new(), o)));
+        let stop = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(Mutex::new(Indexing::Running));
+        let (file, codec) = (self.file.clone(), self.codec);
+        let thread = {
+            let (index, reader, stop, state) =
+                (index.clone(), reader.clone(), stop.clone(), state.clone());
+            std::thread::Builder::new()
+                .name("tarloupe-index".into())
+                .spawn(move || {
+                    let r = self.build(Some((&live, reader.as_deref())), Some(&stop));
+                    let now = match r {
+                        Ok(done) => {
+                            index.replace(done);
+                            Indexing::Done
+                        }
+                        Err(e) => Indexing::Failed(e.to_string()),
+                    };
+                    *state.lock().unwrap_or_else(|e| e.into_inner()) = now;
+                })?
+        };
+        Ok(Archive {
+            path,
+            file,
+            codec,
+            index,
+            status,
+            reader,
+            building: Some(Building {
+                cancel: stop,
+                state,
+                thread: Mutex::new(Some(thread)),
+            }),
+        })
+    }
+
+    /// Reads the whole archive, passing on what it finds; returns the
+    /// length of the tar stream.
+    fn walk(
+        &self,
+        report: &mut Reporter,
+        cancel: Option<Arc<AtomicBool>>,
+        sink: &mut Sink,
+    ) -> Result<u64> {
+        let file = &self.file;
+        Ok(match self.codec {
+            Codec::Gzip if self.threads == 1 => {
+                let mut reader = IndexingReader::new(file.clone(), self.spacing)?;
+                walk_compressed(&mut reader, report, sink)?;
+                reader.position()
+            }
+            Codec::Gzip => {
+                let mut reader = crate::gzip_par::ParallelIndexer::new(
+                    file.clone(),
+                    self.spacing,
+                    self.threads,
+                    cancel,
+                )?;
+                walk_compressed(&mut reader, report, sink)?;
+                reader.position()
+            }
             Codec::Bzip2 => {
-                let threads = opts.threads.unwrap_or_else(default_threads);
-                let mut reader = crate::bz2::ParallelIndexer::new(file.clone(), spacing, threads)?;
-                let members = walk_compressed(&mut reader, &mut report)?;
-                let size = reader.position();
-                (members, std::mem::take(&mut reader.checkpoints), size)
+                let mut reader =
+                    crate::bz2::ParallelIndexer::new(file.clone(), self.spacing, self.threads)?;
+                walk_compressed(&mut reader, report, sink)?;
+                reader.position()
             }
             Codec::Zstd | Codec::Xz => {
-                let dec = sequential_decoder(codec, file)?.expect("a compressed codec");
-                let mut reader = Indexer::new(dec, spacing, opts.cancel.clone());
-                let members = walk_compressed(&mut reader, &mut report)?;
-                let size = reader.position();
-                let mut points = std::mem::take(&mut reader.checkpoints);
-                // A frame ending with the data is no use to resume from.
-                points.retain(|c| c.uncompressed_offset < size);
-                (members, points, size)
+                let dec = sequential_decoder(self.codec, file)?.expect("a compressed codec");
+                let mut reader = Indexer::new(dec, self.spacing, cancel);
+                walk_compressed(&mut reader, report, sink)?;
+                reader.position()
             }
             Codec::None => {
                 let mut reader = file.try_clone()?;
                 reader.seek(SeekFrom::Start(0))?;
+                let feed = std::cell::RefCell::new(Feed::new(sink));
                 let counted = Counted {
                     inner: reader,
                     pos: 0,
-                    report: &mut report,
+                    report,
+                    feed: &feed,
                 };
                 let src = SeekSource::new(std::io::BufReader::with_capacity(64 * 1024, counted))?;
-                (
-                    Walker::new(src).collect::<Result<Vec<_>>>()?,
-                    Vec::new(),
-                    key.size,
-                )
+                for e in Walker::new(src) {
+                    feed.borrow_mut().add(e?);
+                }
+                feed.borrow_mut().flush();
+                self.key.size
             }
         })
-    })();
-    if report.cancelled() {
-        return Err(Error::Cancelled);
     }
-    let (members, checkpoints, stream_size) = walked?;
-    report.done();
-    if report.cancelled() {
-        return Err(Error::Cancelled); // cancelled just as it finished
+}
+
+/// Members and checkpoints waiting to be passed on: in batches, so that
+/// a live index is not locked for every member, but at least every 100 ms
+/// (also while a long member is decoded).
+struct Feed<'s> {
+    members: Vec<Entry>,
+    checkpoints: Vec<Checkpoint>,
+    since: std::time::Instant,
+    sink: &'s mut dyn FnMut(Vec<Entry>, Vec<Checkpoint>),
+}
+
+impl<'s> Feed<'s> {
+    fn new(sink: &'s mut dyn FnMut(Vec<Entry>, Vec<Checkpoint>)) -> Self {
+        Feed {
+            members: Vec::new(),
+            checkpoints: Vec::new(),
+            since: std::time::Instant::now(),
+            sink,
+        }
     }
-    // Refuse to publish an index if the file changed while it was read.
-    if ArchiveKey::from_file(file)? != *key {
-        return Err(Error::Unsupported(
-            "the archive changed while it was being indexed; try again".into(),
-        ));
+
+    fn add(&mut self, e: Entry) {
+        self.members.push(e);
+        if self.members.len() >= 4096 {
+            self.flush();
+        } else {
+            self.tick();
+        }
     }
-    let entries = build_tree(members);
-    Index::create(index_path, key, codec, stream_size, &entries, &checkpoints)
+
+    /// Passes on what is waiting if it has waited long enough.
+    fn tick(&mut self) {
+        if (!self.members.is_empty() || !self.checkpoints.is_empty())
+            && self.since.elapsed() >= std::time::Duration::from_millis(100)
+        {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        (self.sink)(
+            std::mem::take(&mut self.members),
+            std::mem::take(&mut self.checkpoints),
+        );
+        self.since = std::time::Instant::now();
+    }
 }
 
 /// A decompressing reader used for indexing.
-trait Indexing: Read {
+trait IndexingRead: Read {
     fn compressed_position(&self) -> u64;
+    /// The checkpoints recorded since the last call.
+    fn take_checkpoints(&mut self) -> Vec<Checkpoint>;
 }
 
-impl Indexing for IndexingReader {
+impl IndexingRead for IndexingReader {
     fn compressed_position(&self) -> u64 {
         IndexingReader::compressed_position(self)
     }
-}
-
-impl Indexing for crate::gzip_par::ParallelIndexer {
-    fn compressed_position(&self) -> u64 {
-        crate::gzip_par::ParallelIndexer::compressed_position(self)
+    fn take_checkpoints(&mut self) -> Vec<Checkpoint> {
+        std::mem::take(&mut self.checkpoints)
     }
 }
 
-impl Indexing for crate::bz2::ParallelIndexer {
+impl IndexingRead for crate::gzip_par::ParallelIndexer {
+    fn compressed_position(&self) -> u64 {
+        crate::gzip_par::ParallelIndexer::compressed_position(self)
+    }
+    fn take_checkpoints(&mut self) -> Vec<Checkpoint> {
+        std::mem::take(&mut self.checkpoints)
+    }
+}
+
+impl IndexingRead for crate::bz2::ParallelIndexer {
     fn compressed_position(&self) -> u64 {
         crate::bz2::ParallelIndexer::compressed_position(self)
+    }
+    fn take_checkpoints(&mut self) -> Vec<Checkpoint> {
+        std::mem::take(&mut self.checkpoints)
+    }
+}
+
+impl IndexingRead for Indexer {
+    fn compressed_position(&self) -> u64 {
+        Indexer::compressed_position(self)
+    }
+    fn take_checkpoints(&mut self) -> Vec<Checkpoint> {
+        std::mem::take(&mut self.checkpoints)
     }
 }
 
@@ -631,37 +892,47 @@ pub(crate) fn default_threads() -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
-impl Indexing for Indexer {
-    fn compressed_position(&self) -> u64 {
-        Indexer::compressed_position(self)
-    }
-}
-
 /// Walks the tar stream an indexing reader decompresses.
-fn walk_compressed(reader: &mut dyn Indexing, report: &mut Reporter) -> Result<Vec<Entry>> {
+fn walk_compressed(
+    reader: &mut dyn IndexingRead,
+    report: &mut Reporter,
+    sink: &mut Sink,
+) -> Result<()> {
+    let feed = std::cell::RefCell::new(Feed::new(sink));
     let mut r = Progressed {
         inner: reader,
         report,
+        feed: &feed,
     };
-    let members = Walker::new(ReadSource::new(&mut r)).collect::<Result<Vec<_>>>()?;
+    for e in Walker::new(ReadSource::new(&mut r)) {
+        feed.borrow_mut().add(e?);
+    }
     // The walker stops at the tar terminator; decode the rest so a damaged
     // tail or a bad trailer checksum fails here, not later.
     std::io::copy(&mut r, &mut std::io::sink())?;
-    Ok(members)
+    let rest = r.inner.take_checkpoints();
+    let mut feed = feed.borrow_mut();
+    feed.checkpoints.extend(rest);
+    feed.flush();
+    Ok(())
 }
 
 /// Passes indexing progress on, at most once per 1 MiB or 1% read.
 /// Also stops the reads once building is cancelled.
 struct Reporter<'a> {
     progress: Option<&'a Progress>,
-    cancel: Option<&'a AtomicBool>,
+    /// Either flag stops it.
+    cancel: [Option<&'a AtomicBool>; 2],
     total: u64,
     last: u64,
 }
 
 impl Reporter<'_> {
     fn cancelled(&self) -> bool {
-        self.cancel.is_some_and(|c| c.load(Ordering::Relaxed))
+        self.cancel
+            .iter()
+            .flatten()
+            .any(|c| c.load(Ordering::Relaxed))
     }
 
     fn at(&mut self, done: u64) -> std::io::Result<()> {
@@ -694,37 +965,46 @@ impl Reporter<'_> {
     }
 }
 
-/// An indexing reader, reporting how much compressed input it used.
-struct Progressed<'a, 'b> {
-    inner: &'a mut dyn Indexing,
+/// An indexing reader, reporting how much compressed input it used and
+/// collecting the checkpoints it records.
+struct Progressed<'a, 'b, 's> {
+    inner: &'a mut dyn IndexingRead,
     report: &'a mut Reporter<'b>,
+    feed: &'a std::cell::RefCell<Feed<'s>>,
 }
 
-impl Read for Progressed<'_, '_> {
+impl Read for Progressed<'_, '_, '_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
+        {
+            let mut feed = self.feed.borrow_mut();
+            feed.checkpoints.extend(self.inner.take_checkpoints());
+            feed.tick();
+        }
         self.report.at(self.inner.compressed_position())?;
         Ok(n)
     }
 }
 
 /// A plain file, reporting where it is.
-struct Counted<'a, 'b> {
+struct Counted<'a, 'b, 's> {
     inner: File,
     pos: u64,
     report: &'a mut Reporter<'b>,
+    feed: &'a std::cell::RefCell<Feed<'s>>,
 }
 
-impl Read for Counted<'_, '_> {
+impl Read for Counted<'_, '_, '_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.inner.read(buf)?;
         self.pos += n as u64;
+        self.feed.borrow_mut().tick();
         self.report.at(self.pos)?;
         Ok(n)
     }
 }
 
-impl Seek for Counted<'_, '_> {
+impl Seek for Counted<'_, '_, '_> {
     fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
         // Not reported: setting up the walker seeks to the end to learn the
         // length and back, and the next read reports the real position.

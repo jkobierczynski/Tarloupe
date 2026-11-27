@@ -1,11 +1,12 @@
+use std::collections::HashSet;
 use std::ffi::{c_void, OsStr, OsString};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tarloupe_core::vfs::{Node, Vfs};
-use tarloupe_core::{Archive, Error};
+use tarloupe_core::vfs::{windows_path, Node, Vfs};
+use tarloupe_core::{Archive, EntryKind, Error, Indexing};
 use windows::core::{w, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{
     CloseHandle, LocalFree, HANDLE, HLOCAL, NTSTATUS, STATUS_END_OF_FILE,
@@ -28,7 +29,8 @@ use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
     VolumeInfo, WideNameInfo,
 };
-use winfsp::host::{FileSystemHost, VolumeParams};
+use winfsp::host::{FileSystemHost, FileSystemParams, VolumeParams};
+use winfsp::notify::{Notifier, NotifyInfo, NotifyingFileSystemContext};
 use winfsp::{FspError, FspInit, U16CStr};
 
 /// Read and execute (`FILE_GENERIC_READ | FILE_GENERIC_EXECUTE`). The
@@ -38,6 +40,13 @@ const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
 const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
 /// Seconds between 1601-01-01 and 1970-01-01.
 const EPOCH_DIFF: i64 = 11_644_473_600;
+/// How often new members are announced while the archive is indexed.
+const NOTIFY_MS: u32 = 1000;
+/// Most members announced at a time; the rest wait for the next round.
+const NOTIFY_BATCH: usize = 4096;
+const FILE_NOTIFY_CHANGE_FILE_NAME: u32 = 0x1;
+const FILE_NOTIFY_CHANGE_DIR_NAME: u32 = 0x2;
+const FILE_ACTION_ADDED: u32 = 0x1;
 /// Held from choosing a free drive letter until it is taken, so mounts made
 /// at once in one process do not pick the same letter.
 static PICK_DRIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -123,6 +132,10 @@ impl Drop for Mount {
 
 /// Mounts `archive` read-only at `point`: a drive letter (`X:`), or a
 /// folder that does not exist yet. `None` picks the next free drive letter.
+///
+/// An archive still being indexed (see [`Archive::open_live`]) can be
+/// mounted right away: members appear as they are found, and folders that
+/// are open in Explorer (or anything else that listed them) are told.
 pub fn mount(archive: Arc<Archive>, point: Option<&OsStr>) -> Result<Mount, MountError> {
     let init = load_winfsp()?;
     let label = archive
@@ -138,7 +151,13 @@ pub fn mount(archive: Arc<Archive>, point: Option<&OsStr>) -> Result<Mount, Moun
         last_ms: AtomicU64::new(0),
         open: AtomicUsize::new(0),
     });
+    let live = (archive.indexing() == Indexing::Running).then(|| Watch {
+        after: Mutex::new(0),
+        listed: Mutex::new(HashSet::new()),
+        done: AtomicBool::new(false),
+    });
     let fs = TarFs {
+        live,
         vfs: Vfs::new(archive).map_err(MountError::Archive)?,
         sd: security_descriptor()?,
         label,
@@ -163,8 +182,11 @@ pub fn mount(archive: Arc<Archive>, point: Option<&OsStr>) -> Result<Mount, Moun
         // cache lets go of the file.
         .post_cleanup_when_modified_only(false)
         // Nothing ever changes, so the kernel may cache metadata for long.
+        // Folders do grow while the archive is indexed: announcing new
+        // members drops what the kernel cached, and as a fallback it
+        // keeps folder contents only briefly then.
         .file_info_timeout(60_000)
-        .dir_info_timeout(60_000)
+        .dir_info_timeout(if fs.live.is_some() { 1_000 } else { 60_000 })
         .volume_info_timeout(60_000)
         .security_timeout(60_000);
     let _picking = PICK_DRIVE.lock().unwrap_or_else(|e| e.into_inner());
@@ -172,7 +194,15 @@ pub fn mount(archive: Arc<Archive>, point: Option<&OsStr>) -> Result<Mount, Moun
         Some(p) => p.to_os_string(),
         None => free_drive().ok_or_else(|| MountError::WinFsp("no free drive letter".into()))?,
     };
-    let mut host = FileSystemHost::<TarFs>::new(params, fs).map_err(fsp)?;
+    let mut host = if fs.live.is_some() {
+        FileSystemHost::<TarFs>::new_with_timer::<Vec<NotifyInfo<512>>, NOTIFY_MS>(
+            FileSystemParams::default_params(params),
+            fs,
+        )
+    } else {
+        FileSystemHost::<TarFs>::new(params, fs)
+    }
+    .map_err(fsp)?;
     host.mount(&point).map_err(fsp)?;
     host.start().map_err(fsp)?;
     Ok(Mount {
@@ -316,11 +346,24 @@ fn security_descriptor() -> Result<Vec<u8>, MountError> {
 
 struct TarFs {
     vfs: Vfs,
+    /// Set while the archive is still being indexed.
+    live: Option<Watch>,
     /// Self-relative security descriptor shared by every file.
     sd: Vec<u8>,
     label: String,
     total: u64,
     activity: Arc<Activity>,
+}
+
+/// Announces members found while the archive is mounted.
+struct Watch {
+    /// Members with ids up to here were announced (or needed not be).
+    after: Mutex<i64>,
+    /// Archive paths of the directories something listed: only those can
+    /// be shown or cached anywhere, so only their new members are told.
+    listed: Mutex<HashSet<Vec<u8>>>,
+    /// Indexing ended and every member was looked at.
+    done: AtomicBool,
 }
 
 pub struct Handle {
@@ -502,6 +545,14 @@ impl FileSystemContext for TarFs {
         // Fill the buffer on the first read; later reads continue from the
         // marker. WinFsp sorts the entries and applies the pattern.
         if let Ok(lock) = context.dir.acquire(marker.is_none(), None) {
+            if let Some(w) = &self.live {
+                if !w.done.load(Ordering::Relaxed) {
+                    w.listed
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(context.node.entry.path.clone());
+                }
+            }
             let listing = self.vfs.list(&context.node).map_err(map_err)?;
             let is_root = context.node.entry.path.is_empty();
             if !is_root {
@@ -527,5 +578,62 @@ impl FileSystemContext for TarFs {
         out.free_size = 0;
         out.set_volume_label(&self.label);
         Ok(())
+    }
+}
+
+impl NotifyingFileSystemContext<Vec<NotifyInfo<512>>> for TarFs {
+    /// The members found since the last round, in listed directories.
+    fn should_notify(&self) -> Option<Vec<NotifyInfo<512>>> {
+        let w = self.live.as_ref()?;
+        if w.done.load(Ordering::Relaxed) {
+            return None;
+        }
+        // Read before the members: if indexing has ended now, this round
+        // sees every member there is.
+        let ended = self.vfs.archive().indexing() != Indexing::Running;
+        let mut after = w.after.lock().unwrap_or_else(|e| e.into_inner());
+        let found = self
+            .vfs
+            .archive()
+            .index()
+            .entries_after(*after, NOTIFY_BATCH)
+            .ok()?;
+        if found.len() < NOTIFY_BATCH && ended {
+            w.done.store(true, Ordering::Relaxed);
+            w.listed.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        }
+        let last = found.last()?;
+        *after = last.id;
+        drop(after);
+        let listed = w.listed.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        for e in &found {
+            let parent = match e.path.iter().rposition(|&c| c == b'/') {
+                Some(i) => &e.path[..i],
+                None if e.path.is_empty() => continue,
+                None => &b""[..],
+            };
+            if !listed.contains(parent) {
+                continue;
+            }
+            let mut info = NotifyInfo::<512>::new();
+            info.filter = if e.kind == EntryKind::Dir {
+                FILE_NOTIFY_CHANGE_DIR_NAME
+            } else {
+                FILE_NOTIFY_CHANGE_FILE_NAME
+            };
+            info.action = FILE_ACTION_ADDED;
+            // Paths too long to announce are left to the next listing.
+            if info.set_name(windows_path(&e.path)).is_ok() {
+                out.push(info);
+            }
+        }
+        (!out.is_empty()).then_some(out)
+    }
+
+    fn notify(&self, found: Vec<NotifyInfo<512>>, notifier: &Notifier) {
+        for info in &found {
+            notifier.notify(info);
+        }
     }
 }

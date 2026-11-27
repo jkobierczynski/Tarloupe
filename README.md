@@ -26,6 +26,7 @@ $ tarloupe convert slow.tar.xz      # make slow.tar.zst, which reads fast (see b
 
 PS> tarloupe mount big.tar.gz               # Windows: next free drive, e.g. Z:
 PS> tarloupe mount big.tar.gz C:\mnt\big     # or a folder that does not exist yet
+PS> tarloupe mount --live big.tar.gz        # mount before indexing ends; members fill in
 PS> tarloupe browse big.tar.gz              # open it in Explorer; unmounts when idle
 PS> tarloupe explorer install               # add "Browse with Tarloupe" to the right-click menu
 ```
@@ -43,10 +44,19 @@ been closed for two minutes (`tarloupe browse --idle-timeout` changes
 that). Browsing the same archive again opens another window on the same
 mount.
 
+The window opens at once, also for an archive that was never indexed:
+indexing goes on in the background, and members appear as it finds them.
+Folders open in Explorer (or listed by any other program) are told about
+their new members and refresh themselves. Members already found can be
+opened and copied while indexing goes on. The mount stays up until
+indexing is done, so the work is not lost when the window is closed early;
+the next time the archive opens from its finished index. `tarloupe mount
+--live` does the same from the command line.
+
 `tarloupew.exe` runs as one tray agent per Windows session: browsing
 another archive hands it to the agent that is already running. Its tray
-icon shows how far a big archive's first indexing has got and what is
-mounted where; its menu opens or unmounts each archive, or unmounts all
+icon shows what is mounted where and how far a big archive's first
+indexing has got; its menu opens or unmounts each archive, or unmounts all
 and quits. The agent leaves once nothing is mounted.
 
 `tarloupe mount` needs [WinFsp](https://winfsp.dev/rel/)
@@ -263,7 +273,7 @@ partly random, so compressors behave realistically.
 | **M1** gzip engine | Checkpoint index with saved deflate windows, random reads, chunk cache, benchmarks. *(done)* |
 | **M2** Windows MVP | WinFsp read-only mount, "Browse with Tarloupe" in Explorer, tray app, installer. *(done, 0.1.0)* |
 | **M3** More codecs | Seekable/multi-frame zstd, multi-block xz, bzip2 (multi-stream), sequential fallback, `convert`. *(done)* |
-| M4 Speed | Parallel gzip first pass, parallel bzip2 *(both done)*, background indexing while browsing. |
+| M4 Speed | Parallel gzip first pass, parallel bzip2, background indexing while browsing *(all done)*. |
 | M5 Native feel | Shell namespace extension, Windows 11 context menu. |
 | M6 Reach | Linux FUSE, ratarmount index import, nested archives. |
 

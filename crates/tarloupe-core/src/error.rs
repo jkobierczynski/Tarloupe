@@ -27,6 +27,11 @@ pub enum Error {
 
     #[error("cancelled")]
     Cancelled,
+
+    /// Building the index in the background failed (see
+    /// [`crate::Archive::open_live`]).
+    #[error("indexing failed: {0}")]
+    IndexingFailed(String),
 }
 
 impl Error {
